@@ -66,6 +66,9 @@ def run_agent(
     wall = time.perf_counter() - start
 
     (run / "answer.json").write_text(json.dumps(parse_answer(raw), indent=2), encoding="utf-8")
+    transcript = getattr(agent, "transcript", None)
+    if transcript:
+        (run / "transcript.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
     (run / "meta.json").write_text(json.dumps({
         "env_dir": str(Path(env_dir).resolve()),
         "agent": agent.name,
@@ -74,6 +77,7 @@ def run_agent(
         "max_output_chars": max_output_chars,
         "wall_time_s": round(wall, 3),
         "agent_error": error,
+        "raw_answer": raw if isinstance(raw, str) else None,
         "usage": getattr(agent, "usage", None),
     }, indent=2), encoding="utf-8")
     metrics = evaluate_run(run_dir)

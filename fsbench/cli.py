@@ -100,6 +100,46 @@ def cmd_oracle(a) -> None:
     print(f"Oracle solved {ok}/{total} runs; results under {a.out}")
 
 
+FATAL_API_ERRORS = ("HTTP 401", "HTTP 402", "HTTP 403", "No OpenRouter API key")
+
+
+def cmd_run(a) -> None:
+    from fsbench.openrouter import OpenRouterAgent
+
+    envs = find_envs(a.envs)[: a.limit] if a.limit else find_envs(a.envs)
+    if not envs:
+        sys.exit(f"no environments found under {a.envs}")
+    try:
+        agent = OpenRouterAgent(a.model, max_steps=a.max_steps, temperature=a.temperature)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    root = Path(a.envs).resolve()
+    model_dir = a.model.replace("/", "__").replace(":", "_")
+    total_cost, done, solved = 0.0, 0, 0
+    for env in envs:
+        run_name = "__".join(env.resolve().relative_to(root).parts) or env.name
+        for ts in a.toolset:
+            run_dir = Path(a.out) / model_dir / ts / run_name
+            if a.skip_existing and (long_path(run_dir) / "metrics.json").exists():
+                continue
+            m = run_agent(env, agent, run_dir, toolset=ts, allow_writes=not a.no_writes)
+            meta = json.loads((long_path(run_dir) / "meta.json").read_text(encoding="utf-8"))
+            cost = (m.get("usage") or {}).get("cost_usd") or 0.0
+            total_cost += cost
+            done += 1
+            solved += m["success"]
+            status = "PASS" if m["success"] else "FAIL"
+            print(f"  {status} {run_name} [{ts}] score={m['score']:.2f} calls={m['n_calls']} "
+                  f"regret={m['navigation_regret']} cost=${cost:.4f}", flush=True)
+            err = meta.get("agent_error") or ""
+            if err:
+                print("    agent error: " + err.strip().splitlines()[-1])
+                if any(s in err for s in FATAL_API_ERRORS):
+                    sys.exit("Stopping: the API rejected the request (check your key, credits, or model access).")
+    print(f"{solved}/{done} runs succeeded; total cost ${total_cost:.4f}. Results under {a.out}")
+    print(f"Summarise with: fsbench evaluate --runs {a.out} --out results.csv")
+
+
 def _print_table(rows: list[dict]) -> None:
     if not rows:
         return
@@ -174,6 +214,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--out", required=True)
     p.add_argument("--toolset", nargs="+", default=["files"], choices=sorted(TOOLSETS))
     p.set_defaults(fn=cmd_oracle)
+
+    p = sub.add_parser("run", help="run an OpenRouter model as the agent over environments")
+    p.add_argument("--envs", required=True, help="an environment folder or a folder of environments")
+    p.add_argument("--model", required=True, help="OpenRouter model slug, e.g. openai/gpt-4o-mini")
+    p.add_argument("--out", required=True)
+    p.add_argument("--toolset", nargs="+", default=["files"], choices=sorted(TOOLSETS))
+    p.add_argument("--max-steps", type=int, default=40, help="maximum model turns per run")
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--limit", type=int, help="only run the first N environments")
+    p.add_argument("--no-writes", action="store_true", help="disable write_file (scratch-memory ablation)")
+    p.add_argument("--skip-existing", action="store_true", help="skip runs that already have metrics.json")
+    p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("evaluate", help="score runs and summarise")
     p.add_argument("--runs", required=True)
