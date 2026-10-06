@@ -10,6 +10,7 @@ from fsbench.evaluate import mean_se
 PLOT_METRICS = [
     ("success", "Success"),
     ("n_calls", "Tool calls"),
+    ("files_read", "Files read"),
     ("total_tokens", "Total tokens"),
     ("cost_usd", "API cost (USD)"),
     ("wall_time_s", "Wall time (s)"),

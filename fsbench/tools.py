@@ -217,6 +217,9 @@ class ToolSet:
             self._cur["missing"].append(p)
             raise ToolError(f"{raw}: No such file or directory (only {VROOT} is accessible)")
         os_path = self.root.joinpath(*rel.split("/")) if rel else self.root
+        if not os_path.resolve().is_relative_to(self.root.resolve()):
+            self._cur["missing"].append(p)
+            raise ToolError(f"{raw}: only /workspace is accessible")
         if must_exist:
             if not self._exists_exact(rel):
                 self._cur["missing"].append(p)
@@ -252,6 +255,8 @@ class ToolSet:
             except OSError:
                 continue
             for name in names:
+                if not (d / name).resolve().is_relative_to(self.root.resolve()):
+                    continue
                 child_rel = f"{r}/{name}" if r else name
                 is_dir = (d / name).is_dir()
                 yield child_rel, is_dir, depth + 1
@@ -285,6 +290,8 @@ class ToolSet:
         lines = []
         for name in sorted(os.listdir(os_path)):
             child = os_path / name
+            if not child.resolve().is_relative_to(self.root.resolve()):
+                continue
             child_rel = f"{rel}/{name}" if rel else name
             if child.is_dir():
                 lines.append(f"{name}/")
@@ -446,10 +453,8 @@ class IndexedTools(FileTools):
     def _build_index(self) -> dict:
         docs, df = {}, Counter()
         for r in self._all_files(self.root, ""):
-            try:
-                text = self._text(r)
-            except ToolError:
-                text = ""
+            # Extraction failures are infrastructure errors, not silently empty documents.
+            text = self._text(r)
             tf = Counter(_tokens(r.replace("/", " ")) + _tokens(text))
             docs[r] = (tf, sum(tf.values()), text)
             df.update(tf.keys())
@@ -457,6 +462,8 @@ class IndexedTools(FileTools):
         return {"docs": docs, "df": df, "avg": avg, "n": len(docs)}
 
     def _t_search_index(self, query: str, k: int = 10) -> str:
+        if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+            raise ToolError("k must be a positive integer")
         if self._index is None:
             t0 = time.perf_counter()
             self._index = self._build_index()

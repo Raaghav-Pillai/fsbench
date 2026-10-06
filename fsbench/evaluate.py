@@ -30,6 +30,7 @@ SUMMARY_METRICS = [
     "total_tokens", "tool_output_tokens", "cost_usd", "wall_time_s", "llm_time_s",
     "score", "required_recall_read", "read_precision", "path_hallucination_rate",
     "known_path_regret", "candidate_files_seen", "steps_to_first_required_evidence",
+    "input_tokens", "output_tokens", "tool_time_s",
 ]
 
 
@@ -381,6 +382,11 @@ def flatten_row(metrics: dict, manifest: dict, meta: dict | None = None) -> dict
         desc = meta.get("agent_describe") or {}
         row["agent_prompt_version"] = desc.get("agent_prompt_version")
         row["model"] = meta.get("model") or desc.get("model")
+        for k in ("experiment", "execution_order", "experiment_order_seed", "prompt_version",
+                  "input_sha256", "workspace_sha256"):
+            row[k] = meta.get(k)
+        row["agent_settings"] = json.dumps(desc, sort_keys=True)
+        row["expected_cells"] = json.dumps(meta["expected_cells"], sort_keys=True) if meta.get("expected_cells") else None
     return row
 
 
@@ -457,7 +463,8 @@ def seed_sets(rows: list[dict], expected_values: dict | None = None) -> dict[tup
 
 
 def balance_warnings(rows: list[dict], expected_values: dict | None = None) -> list[str]:
-    warnings = []
+    from fsbench.interaction import factorial_pairing
+    warnings = factorial_pairing(rows)[1]
     for key, by_val in seed_sets(rows, expected_values).items():
         sets = list(by_val.values())
         if len(sets) < 2:
@@ -496,7 +503,10 @@ def keep_paired(rows: list[dict], expected_values: dict | None = None) -> list[d
         if all(_pair_seed(r) in intersections[_pair_group(r, var)]
                for var in vars_):
             keep.append(r)
-    return keep
+    from fsbench.interaction import factorial_pairing
+    # Check the original rows so missing cells cannot vanish during legacy filtering.
+    factorial_ids = {id(r) for r in factorial_pairing(rows)[0]}
+    return [r for r in keep if id(r) in factorial_ids]
 
 
 def summarize(rows: list[dict], by: tuple[str, ...] = ("agent", "toolset", "task_type", "condition")) -> list[dict]:

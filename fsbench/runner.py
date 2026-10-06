@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Protocol
 
 from fsbench.evaluate import evaluate_run, parse_answer
+from fsbench.experiment import fingerprint, workspace_inventory
 from fsbench.paths import long_path
 from fsbench.provenance import snapshot
 from fsbench.tools import VROOT, ToolSet, Tracer, make_toolset
@@ -45,6 +46,7 @@ def run_agent(
     toolset: str = "files",
     allow_writes: bool = True,
     max_output_chars: int = 20000,
+    run_context: dict | None = None,
 ) -> dict:
     env, run = long_path(env_dir), long_path(run_dir)
     if run.exists():
@@ -53,6 +55,9 @@ def run_agent(
     shutil.copytree(env / "workspace", run / "workspace")
     task = json.loads((env / "task.json").read_text(encoding="utf-8"))
     manifest = json.loads((env / "manifest.json").read_text(encoding="utf-8"))
+    workspace_sha256 = fingerprint(workspace_inventory(run / "workspace"))
+    if run_context and workspace_sha256 != run_context.get("workspace_sha256"):
+        raise ValueError("trial workspace does not match the experiment plan")
 
     tracer = Tracer(run / "trace.jsonl")
     tools = make_toolset(toolset, run / "workspace", tracer,
@@ -75,10 +80,13 @@ def run_agent(
     agent_describe = describe() if callable(describe) else None
     sweep = manifest.get("sweep") or {}
     (run / "meta.json").write_text(json.dumps({
+        **(run_context or {}),
         "env_dir": str(Path(env_dir).resolve()),
         "env_id": manifest.get("env_id"),
         "agent": agent.name,
         "agent_describe": agent_describe,
+        "prompt_version": (agent_describe or {}).get("agent_prompt_version"),
+        "workspace_sha256": workspace_sha256,
         "model": (agent_describe or {}).get("model"),
         "task": manifest["task"]["type"],
         "toolset": toolset,

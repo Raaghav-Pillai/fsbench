@@ -126,6 +126,7 @@ FATAL_API_ERRORS = ("HTTP 401", "HTTP 402", "HTTP 403", "No OpenRouter API key")
 
 def cmd_run(a) -> None:
     from fsbench.openrouter import OpenRouterAgent
+    from fsbench.experiment import build_schedule, save_plan, validate_environment
 
     envs = select_envs(find_envs(a.envs), replicates=a.replicates, only=a.only)
     if not envs:
@@ -136,27 +137,44 @@ def cmd_run(a) -> None:
         sys.exit(str(e))
     root = Path(a.envs).resolve()
     model_dir = a.model.replace("/", "__").replace(":", "_")
+    schedule = build_schedule(envs, a.toolset, order_seed=a.order_seed, check_index="indexed" in a.toolset)
+    experiment = a.experiment or ("filename_noise_toolset_interaction_v1" if len(set(a.toolset)) > 1 else "fsbench")
+    cells = sorted({(c["filename_noise"], c["toolset"]) for c in schedule})
+    expected_cells = [{"filename_noise": n, "toolset": t} for n, t in cells]
+    plan = {"experiment": experiment, "model": a.model, "temperature": a.temperature,
+            "max_steps": a.max_steps, "allow_writes": not a.no_writes,
+            "experiment_order_seed": a.order_seed, "expected_cells": expected_cells,
+            "agent_describe": agent.describe(), "schedule": schedule}
+    save_plan(Path(a.out) / "experiment.json", plan)
     total_cost, done, solved = 0.0, 0, 0
-    for env in envs:
+    for cell in schedule:
+        env, ts = Path(cell["env_dir"]), cell["toolset"]
         run_name = "__".join(env.resolve().relative_to(root).parts) or env.name
-        for ts in a.toolset:
-            run_dir = Path(a.out) / model_dir / ts / run_name
-            if a.skip_existing and (long_path(run_dir) / "metrics.json").exists():
-                continue
-            m = run_agent(env, agent, run_dir, toolset=ts, allow_writes=not a.no_writes)
+        run_dir = Path(a.out) / model_dir / ts / run_name
+        if a.skip_existing and (long_path(run_dir) / "metrics.json").exists():
             meta = json.loads((long_path(run_dir) / "meta.json").read_text(encoding="utf-8"))
-            cost = (m.get("usage") or {}).get("cost_usd") or 0.0
-            total_cost += cost
-            done += 1
-            solved += m["success"]
-            status = "PASS" if m["success"] else "FAIL"
-            print(f"  {status} {run_name} [{ts}] score={m['score']:.2f} calls={m['n_calls']} "
-                  f"discovery_regret={m['discovery_regret']} cost=${cost:.4f}", flush=True)
-            err = meta.get("agent_error") or ""
-            if err:
-                print("    agent error: " + err.strip().splitlines()[-1])
-                if any(s in err for s in FATAL_API_ERRORS):
-                    sys.exit("Stopping: the API rejected the request (check your key, credits, or model access).")
+            if any(meta.get(k) != v for k, v in {"experiment": experiment,
+                    "execution_order": cell["execution_order"], "input_sha256": cell["input_sha256"],
+                    "experiment_order_seed": a.order_seed, "agent_describe": agent.describe()}.items()):
+                sys.exit(f"existing run does not match experiment plan: {run_dir}")
+            continue
+        if validate_environment(env) != {k: cell[k] for k in ("workspace_sha256", "input_sha256")}:
+            sys.exit(f"environment changed since planning: {env}")
+        context = {**cell, "experiment": experiment, "expected_cells": expected_cells}
+        m = run_agent(env, agent, run_dir, toolset=ts, allow_writes=not a.no_writes, run_context=context)
+        meta = json.loads((long_path(run_dir) / "meta.json").read_text(encoding="utf-8"))
+        cost = (m.get("usage") or {}).get("cost_usd") or 0.0
+        total_cost += cost
+        done += 1
+        solved += m["success"]
+        status = "PASS" if m["success"] else "FAIL"
+        print(f"  [{cell['execution_order']}/{len(schedule)}] {status} {run_name} [{ts}] "
+              f"score={m['score']:.2f} calls={m['n_calls']} cost=${cost:.6f}", flush=True)
+        err = meta.get("agent_error") or ""
+        if err:
+            print("    agent error: " + err.strip().splitlines()[-1])
+            if any(s in err for s in FATAL_API_ERRORS):
+                sys.exit("Stopping: the API rejected the request (check your key, credits, or model access).")
     print(f"{solved}/{done} runs succeeded; total cost ${total_cost:.4f}. Results under {a.out}")
     print(f"Summarise with: fsbench evaluate --runs {a.out} --out results.csv")
 
@@ -184,6 +202,30 @@ def cmd_evaluate(a) -> None:
     print(f"Evaluated {len(rows)} runs" + (f"; wrote {a.out}" if a.out else ""))
     by = tuple(a.group_by.split(",")) if a.group_by else ("agent", "toolset", "task_type", "condition")
     _print_table(summarize(rows, by))
+    if a.interaction:
+        from fsbench.interaction import write_interaction
+        target = Path(a.out).parent if a.out else Path(a.runs)
+        report = write_interaction(rows, target, bootstrap_seed=a.bootstrap_seed)
+        print(f"Interaction analysis: {report}")
+
+
+def cmd_validate(a) -> None:
+    from fsbench.experiment import validate_environment
+    from fsbench.integrity import verify
+
+    if a.filename_noise:
+        print(json.dumps(verify(a.envs), indent=2))
+    envs = find_envs(a.envs)
+    if not envs:
+        sys.exit("no environments found")
+    for env in envs:
+        validate_environment(env, check_index=a.index)
+    print(f"Validated {len(envs)} environments" + (" and their indexes" if a.index else ""))
+
+
+def cmd_compare_trace(a) -> None:
+    from fsbench.interaction import compare_trace
+    print(compare_trace(a.runs, a.seed, a.noise))
 
 
 def cmd_plot(a) -> None:
@@ -268,6 +310,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--only", help="keep environments from one swept variable, e.g. depth")
     p.add_argument("--no-writes", action="store_true", help="disable write_file (scratch-memory ablation)")
     p.add_argument("--skip-existing", action="store_true", help="skip runs that already have metrics.json")
+    p.add_argument("--order-seed", type=int, default=7, help="reproducible within-seed trial order")
+    p.add_argument("--experiment", help="experiment identifier recorded with the saved schedule")
     p.set_defaults(fn=cmd_run)
 
     p = sub.add_parser("evaluate", help="score runs and summarise")
@@ -278,6 +322,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="expected conditions (new sweeps also store these automatically)")
     p.add_argument("--group-by", help=f"comma-separated columns (default agent,toolset,task_type,condition); "
                                       f"summary metrics: {', '.join(SUMMARY_METRICS)}")
+    p.add_argument("--interaction", action="store_true", help="write paired toolset/noise tables and bootstrap intervals")
+    p.add_argument("--bootstrap-seed", type=int, default=7)
     p.set_defaults(fn=cmd_evaluate)
 
     p = sub.add_parser("plot", help="plot success/calls/tokens/cost/latency against one variable")
@@ -287,6 +333,18 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--paired", action="store_true")
     p.add_argument("--expect", type=_kv, action="append", default=[], metavar="KEY=V1,V2,...")
     p.set_defaults(fn=cmd_plot)
+
+    p = sub.add_parser("validate", help="check visible file bytes and optional filename pairing/index integrity")
+    p.add_argument("--envs", required=True)
+    p.add_argument("--filename-noise", action="store_true")
+    p.add_argument("--index", action="store_true")
+    p.set_defaults(fn=cmd_validate)
+
+    p = sub.add_parser("compare-trace", help="annotate matching trials across toolsets")
+    p.add_argument("--runs", required=True)
+    p.add_argument("--seed", type=int, required=True)
+    p.add_argument("--noise", type=float, required=True)
+    p.set_defaults(fn=cmd_compare_trace)
 
     p = sub.add_parser("context", help="dump every file as one text block (no-filesystem condition)")
     p.add_argument("--env", required=True)

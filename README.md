@@ -36,6 +36,8 @@ Use `fsbench --help` for commands, including `sweep` for controlled experiments 
 
 For controlled filename experiments, see the [filename noise guide](docs/filename-noise.md), including the paired 80-run recipe and diagnostic definitions.
 
+To compare retrieval interfaces on those same environments, see the [toolset interaction experiment](docs/toolset-interaction.md).
+
 ## Help out
 
 Contributions are welcome: add realistic tasks, improve file layouts and distractors, extend agent integrations, or run reproducible experiments.
