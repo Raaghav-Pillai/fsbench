@@ -34,6 +34,8 @@ fsbench evaluate --runs runs/demo-model --out results-model.csv
 
 Use `fsbench --help` for commands, including `sweep` for controlled experiments and `plot` for charts (requires `python -m pip install -e ".[plot]"`).
 
+For controlled filename experiments, see the [filename noise guide](docs/filename-noise.md), including the paired 80-run recipe and diagnostic definitions.
+
 ## Help out
 
 Contributions are welcome: add realistic tasks, improve file layouts and distractors, extend agent integrations, or run reproducible experiments.

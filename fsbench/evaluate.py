@@ -28,6 +28,8 @@ FAILURE_TYPES = [
 SUMMARY_METRICS = [
     "success", "evidence_found", "n_calls", "files_read", "discovery_regret",
     "total_tokens", "tool_output_tokens", "cost_usd", "wall_time_s", "llm_time_s",
+    "score", "required_recall_read", "read_precision", "path_hallucination_rate",
+    "known_path_regret", "candidate_files_seen", "steps_to_first_required_evidence",
 ]
 
 
@@ -96,6 +98,10 @@ def evaluate_run(run_dir: str | Path) -> dict:
         "agent_error": bool(meta.get("agent_error")),
         "usage": usage,
         "condition": (manifest.get("condition") or {}).get("label"),
+        "condition_label": (manifest.get("condition") or {}).get("label"),
+        "filename_noise": manifest["config"].get("filename_noise", 0.0),
+        "filename_noise_version": manifest.get("filename_noise_version", 1),
+        "world_seed": manifest["seeds"]["world"],
         "config_hash": (manifest.get("condition") or {}).get("config_hash"),
         "fsbench_version": meta.get("fsbench_version"),
         "git_commit": meta.get("git_commit"),
@@ -130,6 +136,8 @@ def trace_metrics(events: list[dict], manifest: dict) -> dict:
     missing_calls = [e for e in events if e["missing"]]
     first_required = next((e["step"] for e in events if any(
         p in files and files[p]["doc_id"] in required for p in e["read"])), None)
+    candidates = {p for e in events if first_required is None or e["step"] < first_required
+                  for p in e["seen"] if p in files}
     all_required_step = None
     got: set[str] = set()
     for e in events:
@@ -169,6 +177,8 @@ def trace_metrics(events: list[dict], manifest: dict) -> dict:
         "tool_output_tokens": output_chars // 4,
         "truncated_outputs": sum(1 for e in events if e["truncated"]),
         "steps_to_first_required": first_required,
+        "steps_to_first_required_evidence": first_required,
+        "candidate_files_seen": len(candidates),
         "steps_to_all_required": all_required_step,
         "known_path_optimal_calls": known,
         "discovery_optimal_calls": discovery,
@@ -358,6 +368,7 @@ def flatten_row(metrics: dict, manifest: dict, meta: dict | None = None) -> dict
     sweep = manifest.get("sweep") or {}
     row["sweep.vars"] = ";".join(f"{k}={v}" for k, v in (sweep.get("vars") or {}).items())
     row["sweep.replicate"] = sweep.get("replicate")
+    row["sweep.expected_values"] = json.dumps(sweep.get("expected_values") or {}, sort_keys=True)
     cond = manifest.get("condition") or {}
     row["condition"] = cond.get("label") or row["sweep.vars"] or "default"
     row["config_hash"] = cond.get("config_hash")
@@ -373,7 +384,8 @@ def flatten_row(metrics: dict, manifest: dict, meta: dict | None = None) -> dict
     return row
 
 
-def evaluate_runs(root: str | Path, out_csv: str | Path | None = None) -> list[dict]:
+def evaluate_runs(root: str | Path, out_csv: str | Path | None = None, *, paired: bool = False,
+                  expected_values: dict | None = None) -> list[dict]:
     rows = []
     for run in find_runs(root):
         metrics = evaluate_run(run)
@@ -381,8 +393,14 @@ def evaluate_runs(root: str | Path, out_csv: str | Path | None = None) -> list[d
         meta = json.loads((long_path(run) / "meta.json").read_text(encoding="utf-8"))
         manifest = json.loads((long_path(meta["env_dir"]) / "manifest.json").read_text(encoding="utf-8"))
         rows.append({"run_dir": str(run), **flatten_row(metrics, manifest, meta)})
-    if out_csv and rows:
-        keys = list(dict.fromkeys(k for r in rows for k in r))
+    keys = list(dict.fromkeys(k for r in rows for k in r))
+    for warning in balance_warnings(rows, expected_values):
+        print(f"warning: {warning}", file=sys.stderr)
+    if paired:
+        before = len(rows)
+        rows = keep_paired(rows, expected_values)
+        print(f"Paired filter: kept {len(rows)}/{before} runs")
+    if out_csv:
         with open(out_csv, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=keys)
             w.writeheader()
@@ -391,7 +409,9 @@ def evaluate_runs(root: str | Path, out_csv: str | Path | None = None) -> list[d
 
 
 def _sweep_vars(row: dict) -> dict[str, str]:
-    raw = row.get("sweep.vars") or ""
+    if not row.get("sweep.vars") and row.get("filename_noise") is not None:
+        return {"filename_noise": str(row["filename_noise"])}
+    raw = row.get("sweep.vars") or row.get("condition") or ""
     if not raw:
         return {}
     out = {}
@@ -402,25 +422,49 @@ def _sweep_vars(row: dict) -> dict[str, str]:
     return out
 
 
-def seed_sets(rows: list[dict]) -> dict[tuple, dict[str, set]]:
-    """(agent, toolset, task_type, variable) -> {condition_value: set(world_seed)}."""
+def _condition_value(value) -> str:
+    try:
+        return f"{float(value):g}"
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _pair_group(row: dict, var: str) -> tuple:
+    # Hold non-swept configuration, task/layout seed policy and agent settings fixed.
+    config_key = "mime_types" if var == "mime_diversity" else var
+    config = tuple(sorted((k, str(v)) for k, v in row.items()
+                          if k.startswith("cfg.") and k != f"cfg.{config_key}"))
+    return (row.get("agent"), row.get("toolset"), row.get("task_type"), var,
+            row.get("allow_writes"), row.get("filename_noise_version"), config)
+
+
+def _pair_seed(row: dict) -> tuple:
+    return tuple(row.get(f"seed.{k}") for k in ("world", "task", "layout"))
+
+
+def seed_sets(rows: list[dict], expected_values: dict | None = None) -> dict[tuple, dict[str, set]]:
+    """Fixed-condition groups -> {condition_value: set((world, task, layout))}."""
     groups: dict[tuple, dict[str, set]] = defaultdict(lambda: defaultdict(set))
     for r in rows:
-        seed = r.get("seed.world")
+        expected = json.loads(r.get("sweep.expected_values") or "{}")
+        expected.update(expected_values or {})
         for var, val in _sweep_vars(r).items():
-            groups[(r.get("agent"), r.get("toolset"), r.get("task_type"), var)][val].add(seed)
+            group = groups[_pair_group(r, var)]
+            group[_condition_value(val)].add(_pair_seed(r))
+            for value in expected.get(var, []):
+                group[_condition_value(value)]  # Keep completely missing conditions visible.
     return groups
 
 
-def balance_warnings(rows: list[dict]) -> list[str]:
+def balance_warnings(rows: list[dict], expected_values: dict | None = None) -> list[str]:
     warnings = []
-    for key, by_val in seed_sets(rows).items():
+    for key, by_val in seed_sets(rows, expected_values).items():
         sets = list(by_val.values())
         if len(sets) < 2:
             continue
         union, inter = set.union(*sets), set.intersection(*sets)
         if union != inter:
-            missing = {val: sorted(union - seeds, key=lambda x: (x is None, x))
+            missing = {val: sorted(union - seeds, key=str)
                        for val, seeds in by_val.items() if union - seeds}
             warnings.append(
                 f"unbalanced seeds for {key[2]} {key[3]} [{key[0]}/{key[1]}]: "
@@ -431,16 +475,16 @@ def balance_warnings(rows: list[dict]) -> list[str]:
 
 def mixed_version_warnings(rows: list[dict]) -> list[str]:
     warnings = []
-    for field in ("fsbench_version", "agent_prompt_version", "model"):
+    for field in ("fsbench_version", "agent_prompt_version", "model", "filename_noise_version"):
         vals = sorted({r.get(field) for r in rows if r.get(field)})
         if len(vals) > 1:
             warnings.append(f"summary mixes {field} values: {vals}")
     return warnings
 
 
-def keep_paired(rows: list[dict]) -> list[dict]:
+def keep_paired(rows: list[dict], expected_values: dict | None = None) -> list[dict]:
     """Drop seeds that are not present in every condition of each swept variable."""
-    sets = seed_sets(rows)
+    sets = seed_sets(rows, expected_values)
     intersections = {key: set.intersection(*by_val.values()) if by_val else set()
                      for key, by_val in sets.items()}
     keep = []
@@ -449,7 +493,7 @@ def keep_paired(rows: list[dict]) -> list[dict]:
         if not vars_:
             keep.append(r)
             continue
-        if all(r.get("seed.world") in intersections[(r.get("agent"), r.get("toolset"), r.get("task_type"), var)]
+        if all(_pair_seed(r) in intersections[_pair_group(r, var)]
                for var in vars_):
             keep.append(r)
     return keep
@@ -465,7 +509,7 @@ def summarize(rows: list[dict], by: tuple[str, ...] = ("agent", "toolset", "task
         s["n"] = len(rs)
         for m in SUMMARY_METRICS:
             vals = [float(r[m]) for r in rs if r.get(m) is not None]
-            s[m] = round(sum(vals) / len(vals), 4) if vals else None
+            s[m] = round(sum(vals) / len(vals), 8 if m == "cost_usd" else 4) if vals else None
         trapped = [r for r in rs if r.get("trap_exposed")]
         s["recovery_rate"] = round(sum(r["recovered"] for r in trapped) / len(trapped), 4) if trapped else None
         counts = Counter(r.get("failure_type") for r in rs if r.get("failure_type"))

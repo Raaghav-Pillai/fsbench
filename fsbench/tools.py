@@ -168,6 +168,18 @@ class ToolSet:
         truncated = len(text) > self.max_output_chars
         if truncated:
             text = text[: self.max_output_chars] + f"\n...[output truncated: {len(text) - self.max_output_chars} more characters]"
+            # Record candidates actually delivered, not paths beyond the output cap.
+            visible = text.split("\n...[output truncated:", 1)[0]
+            complete_lines = visible.rsplit("\n", 1)[0] if "\n" in visible else ""
+            if name in ("ls", "list_directory"):
+                self._cur["seen"] = [p for p in self._cur["seen"]
+                                     if any(line.strip() == posixpath.basename(p)
+                                            or line.rstrip().endswith("  " + posixpath.basename(p))
+                                            or line.strip() == self._v(p)
+                                            for line in complete_lines.splitlines())]
+            else:
+                self._cur["seen"] = [p for p in self._cur["seen"]
+                                     if re.search(re.escape(self._v(p)) + r"(?=$|[\s:])", complete_lines)]
         self.tracer.log({
             "tool": name,
             "category": TOOL_CATEGORY.get(name, "other"),

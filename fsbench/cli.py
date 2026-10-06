@@ -10,10 +10,8 @@ from pathlib import Path
 from fsbench.config import PRESETS, FSConfig
 from fsbench.evaluate import (
     SUMMARY_METRICS,
-    balance_warnings,
     evaluate_runs,
     find_envs,
-    keep_paired,
     mixed_version_warnings,
     select_envs,
     summarize,
@@ -72,6 +70,8 @@ def _generate_label(preset: str | None, sets: list[tuple[str, str]], label: str 
         return f"{preset}:{extras}"
     if preset:
         return preset
+    if len(sets) == 1 and sets[0][0] == "filename_noise":
+        return f"filename_noise={float(sets[0][1]):g}"
     return f"custom:{extras}" if extras else "default"
 
 
@@ -165,7 +165,8 @@ def _print_table(rows: list[dict]) -> None:
     if not rows:
         return
     cols = list(rows[0])
-    fmt = [[("" if r[c] is None else f"{r[c]:.3f}" if isinstance(r[c], float) else str(r[c])) for c in cols]
+    fmt = [[("" if r[c] is None else format(r[c], ".6f" if c == "cost_usd" else ".3f")
+             if isinstance(r[c], float) else str(r[c])) for c in cols]
            for r in rows]
     widths = [max(len(c), *(len(f[i]) for f in fmt)) for i, c in enumerate(cols)]
     print("  ".join(c.ljust(w) for c, w in zip(cols, widths)))
@@ -174,14 +175,11 @@ def _print_table(rows: list[dict]) -> None:
 
 
 def cmd_evaluate(a) -> None:
-    rows = evaluate_runs(a.runs, a.out)
+    expected = {k: v.split(",") for k, v in a.expect}
+    rows = evaluate_runs(a.runs, a.out, paired=a.paired, expected_values=expected)
     if not rows:
-        sys.exit(f"no runs found under {a.runs}")
-    if a.paired:
-        before = len(rows)
-        rows = keep_paired(rows)
-        print(f"Paired filter: kept {len(rows)}/{before} runs")
-    for w in balance_warnings(rows) + mixed_version_warnings(rows):
+        sys.exit(f"no runs available under {a.runs} after any requested pairing")
+    for w in mixed_version_warnings(rows):
         print(f"warning: {w}", file=sys.stderr)
     print(f"Evaluated {len(rows)} runs" + (f"; wrote {a.out}" if a.out else ""))
     by = tuple(a.group_by.split(",")) if a.group_by else ("agent", "toolset", "task_type", "condition")
@@ -191,11 +189,10 @@ def cmd_evaluate(a) -> None:
 def cmd_plot(a) -> None:
     from fsbench.plot import plot_runs
 
-    rows = evaluate_runs(a.runs)
+    rows = evaluate_runs(a.runs, paired=a.paired,
+                         expected_values={k: v.split(",") for k, v in a.expect})
     if not rows:
-        sys.exit(f"no runs found under {a.runs}")
-    if a.paired:
-        rows = keep_paired(rows)
+        sys.exit(f"no runs available under {a.runs} after any requested pairing")
     try:
         paths = plot_runs(rows, a.x, a.out)
     except RuntimeError as e:
@@ -277,6 +274,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--runs", required=True)
     p.add_argument("--out", help="write per-run CSV here")
     p.add_argument("--paired", action="store_true", help="drop seeds that are missing from any condition")
+    p.add_argument("--expect", type=_kv, action="append", default=[], metavar="KEY=V1,V2,...",
+                   help="expected conditions (new sweeps also store these automatically)")
     p.add_argument("--group-by", help=f"comma-separated columns (default agent,toolset,task_type,condition); "
                                       f"summary metrics: {', '.join(SUMMARY_METRICS)}")
     p.set_defaults(fn=cmd_evaluate)
@@ -286,6 +285,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--x", required=True, help="filesystem variable, e.g. depth or filename_noise")
     p.add_argument("--out", required=True, help="directory for PNG files")
     p.add_argument("--paired", action="store_true")
+    p.add_argument("--expect", type=_kv, action="append", default=[], metavar="KEY=V1,V2,...")
     p.set_defaults(fn=cmd_plot)
 
     p = sub.add_parser("context", help="dump every file as one text block (no-filesystem condition)")

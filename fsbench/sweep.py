@@ -68,6 +68,7 @@ def run_sweep(
                 m = generate_env(task, cfg, out_root / env_id, world_seed=seed, task_seed=seed,
                                  layout_seed=seed, env_id=env_id,
                                  sweep={"mode": mode, "vars": {k: _fmt(v) for k, v in cond.items()},
+                                        "expected_values": {k: [_fmt(v) for v in vary[k]] for k in cond},
                                         "replicate": r})
                 index.append({
                     "env_id": env_id, "task_type": task, "replicate": r, "seed": seed,

@@ -13,6 +13,9 @@ PLOT_METRICS = [
     ("total_tokens", "Total tokens"),
     ("cost_usd", "API cost (USD)"),
     ("wall_time_s", "Wall time (s)"),
+    ("read_precision", "Read precision"),
+    ("steps_to_first_required_evidence", "Steps to first required evidence"),
+    ("candidate_files_seen", "Candidate files seen before required evidence"),
 ]
 
 
@@ -35,7 +38,8 @@ def _x_value(row: dict, x: str):
     if raw is None:
         return None
     try:
-        return int(raw)
+        value = float(raw)
+        return int(value) if value.is_integer() else value
     except (TypeError, ValueError):
         try:
             return float(raw)

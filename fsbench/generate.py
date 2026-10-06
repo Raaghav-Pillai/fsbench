@@ -18,13 +18,13 @@ from collections import Counter
 from pathlib import Path
 
 from fsbench.config import FSConfig
-from fsbench.layout import Entry, place_entries, select_entries
+from fsbench.layout import FILENAME_NOISE_VERSION, Entry, place_entries, select_entries
 from fsbench.paths import long_path
 from fsbench.render import render
 from fsbench.tasks import TASK_TYPES, extract_decoy
 from fsbench.world import build_world
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 
 
 def generate_env(
@@ -44,7 +44,7 @@ def generate_env(
     world = build_world(world_seed)
     task = TASK_TYPES[task_type].build(world, task_seed)
     entries = select_entries(task, cfg, world_seed, layout_seed)
-    place_entries(entries, cfg, layout_seed)
+    place_entries(entries, cfg, layout_seed, world_seed=world_seed)
 
     out = long_path(out_dir)
     workspace = out / "workspace"
@@ -71,6 +71,9 @@ def generate_env(
             "copy": e.copy,
             "scattered": e.scattered,
             "noisy_name": e.noisy_name,
+            "clean_name": e.clean_name,
+            "filename_noise_score": e.noise_score,
+            "sha256": hashlib.sha256(data).hexdigest(),
         })
 
     required_ids = [d.doc_id for d in task.required]
@@ -86,6 +89,7 @@ def generate_env(
                 decoys[f["doc_id"]] = extra
     manifest = {
         "manifest_version": MANIFEST_VERSION,
+        "filename_noise_version": FILENAME_NOISE_VERSION,
         "env_id": env_id,
         "task": {
             "type": task.task_type,
@@ -119,7 +123,7 @@ def _condition(cfg: FSConfig, label: str | None, sweep: dict | None) -> dict:
     if sweep and sweep.get("vars"):
         cond_label = ";".join(f"{k}={v}" for k, v in sweep["vars"].items())
     else:
-        cond_label = label or "default"
+        cond_label = label or f"filename_noise={cfg.filename_noise:g}"
     dumped = json.dumps(cfg.to_dict(), sort_keys=True, default=str)
     return {"label": cond_label, "config_hash": hashlib.sha1(dumped.encode()).hexdigest()[:8]}
 

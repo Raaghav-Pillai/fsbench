@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import hashlib
+import re
 
 from fsbench.config import FSConfig
 from fsbench.distractors import generic_doc
@@ -46,6 +48,8 @@ class Entry:
     name: str = ""
     scattered: bool = False
     noisy_name: bool = False
+    clean_name: str = ""
+    noise_score: float = 0.0
 
     @property
     def key(self) -> str:
@@ -56,25 +60,25 @@ class Entry:
         return "/".join((*self.dirs, self.name))
 
 
-def _noisy_stem(rng) -> str:
-    n = rng.randint(1, 40)
-    style = rng.randrange(14)
-    return [
-        lambda: str(rng.randint(1000, 999999)),
-        lambda: "final",
-        lambda: f"final{rng.randint(2, 4)}",
-        lambda: "final_FINAL",
-        lambda: f"final_v{rng.randint(2, 5)}_NEW({rng.randint(1, 9)})",
-        lambda: f"scan_{rng.randint(1, 9999):04d}",
-        lambda: f"Document{n}",
-        lambda: f"untitled{n}",
-        lambda: f"IMG_{rng.randint(1000, 9999)}",
-        lambda: f"export ({n})",
-        lambda: "Copy of report",
-        lambda: f"download ({n})",
-        lambda: f"{rng.getrandbits(32):08x}",
-        lambda: f"notes_{n}",
-    ][style]()
+FILENAME_NOISE_VERSION = 2
+
+
+def _noisy_stem(entry: Entry, noise: float, world_seed: int) -> str:
+    """Nested semantic stages; opaque identifiers never encode role or status."""
+    token = hashlib.sha256(f"{world_seed}\0{entry.key}".encode()).hexdigest()[:12]
+    if noise <= 1 / 3:
+        # Retain lexical context but remove status, version, dates and numeric IDs.
+        words = re.split(r"[_\W]+", entry.doc.stem)
+        stop = {"signed", "executed", "draft", "final", "expired", "old", "stale",
+                "redline", "current", "superseded", "copy", "backup", "new"}
+        context = "_".join(w for w in words if w and w.lower() not in stop
+                           and not any(c.isdigit() for c in w))
+        prefix = context or entry.doc.kind
+    elif noise <= 2 / 3:
+        prefix = entry.doc.kind
+    else:
+        prefix = "doc"
+    return f"{prefix[:MAX_STEM - 13]}_{token}"
 
 
 def _fit_depth(home: tuple[str, ...], depth: int | None, seed: int) -> tuple[str, ...]:
@@ -123,7 +127,8 @@ def select_entries(task: TaskInstance, cfg: FSConfig, world_seed: int, seed: int
     return entries
 
 
-def place_entries(entries: list[Entry], cfg: FSConfig, seed: int) -> None:
+def place_entries(entries: list[Entry], cfg: FSConfig, seed: int, *, world_seed: int | None = None) -> None:
+    world_seed = seed if world_seed is None else world_seed
     for e in entries:
         doc = e.doc
         allowed = sorted(f for f in doc.formats if f in cfg.mime_types) or sorted(cfg.mime_types)
@@ -142,9 +147,7 @@ def place_entries(entries: list[Entry], cfg: FSConfig, seed: int) -> None:
         stem = doc.stem
         if e.copy:
             stem += keyed_rng(seed, "copysuffix", doc.doc_id).choice(COPY_SUFFIXES)
-        if keyed_uniform(seed, "fname", doc.doc_id, e.copy) < cfg.filename_noise:
-            stem = _noisy_stem(keyed_rng(seed, "fnamechoice", doc.doc_id, e.copy))
-            e.noisy_name = True
+        e.noisy_name = False
         e.name = f"{stem[:MAX_STEM]}.{e.fmt}"
 
     _canonicalize_dirs(entries, seed)
@@ -152,6 +155,22 @@ def place_entries(entries: list[Entry], cfg: FSConfig, seed: int) -> None:
     if cfg.max_entries_per_dir:
         _split_overfull(entries, cfg.max_entries_per_dir)
         _dedupe_names(entries, seed)
+
+    # Reserve every clean path, even names about to disappear, so renaming one
+    # document cannot change another document's clean name through a collision.
+    reserved = {e.path.casefold() for e in entries}
+    for e in _neutral_order(entries, seed):
+        e.clean_name = e.name
+        e.noise_score = keyed_uniform(world_seed, "filename-noise-v2", e.doc.doc_id)
+        e.noisy_name = e.noise_score < cfg.filename_noise
+        if e.noisy_name:
+            stem = _noisy_stem(e, cfg.filename_noise, world_seed)
+            e.name = f"{stem}.{e.fmt}"
+            suffix = 2
+            while e.path.casefold() in reserved:
+                e.name = f"{stem}_{suffix}.{e.fmt}"
+                suffix += 1
+            reserved.add(e.path.casefold())
 
 
 def _neutral_order(entries: list[Entry], seed: int) -> list[Entry]:
@@ -192,7 +211,7 @@ def _split_overfull(entries: list[Entry], limit: int) -> None:
     for d, es in files_in.items():
         if len(es) + len(subdirs[d]) <= limit:
             continue
-        es.sort(key=lambda e: e.name.casefold())
+        es.sort(key=lambda e: e.key)
         for i in range(0, len(es), limit):
             for e in es[i : i + limit]:
                 e.dirs = (*d, f"part_{i // limit + 1:02d}")
