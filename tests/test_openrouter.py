@@ -41,7 +41,10 @@ def test_agent_loop_executes_tools_and_is_scored(make_env, tmp_path):
     assert metrics["n_calls"] == 3
     assert metrics["path_hallucination_rate"] == pytest.approx(1 / 3, abs=1e-3)
     assert metrics["usage"]["llm_calls"] == 3
+    assert metrics["usage"]["total_tokens"] == 45
+    assert metrics["usage"]["llm_latency_s"] >= 0
     assert metrics["usage"]["cost_usd"] == pytest.approx(0.003)
+    assert agent.describe()["agent_prompt_version"] == "v1"
     assert {t["function"]["name"] for t in agent.requests[0]["tools"]} >= {"read_file", "write_file"}
     tool_msgs = [msg for msg in agent.transcript if msg["role"] == "tool"]
     assert [t["tool_call_id"] for t in tool_msgs] == ["c1", "c2", "c3"]

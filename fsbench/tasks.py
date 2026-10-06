@@ -16,7 +16,7 @@ import csv
 import io
 import json
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterator
@@ -56,6 +56,7 @@ class TaskInstance:
     stale_candidates: list[Doc]
     near_pool: Callable[[], Iterator[Doc]]
     output_path: str | None = None
+    decoy_answers: dict[str, dict] = field(default_factory=dict)
 
 
 def _full_prompt(question: str, schema: dict, extra: str = "") -> str:
@@ -73,6 +74,43 @@ def _full_prompt(question: str, schema: dict, extra: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 
+def _employee_answer(e: Employee, *, superseded: bool = False) -> dict:
+    if superseded:
+        return {"employee_id": e.employee_id, "job_title": e.prev_title, "manager": e.prev_manager}
+    return {"employee_id": e.employee_id, "job_title": e.title, "manager": e.manager}
+
+
+def _retrieve_confusable(world: World, target: Employee, task_seed: int):
+    prng = keyed_rng("near", world.seed, task_seed, "retrieve")
+    used_ids = {e.employee_id for e in world.employees}
+    used_names = {e.name for e in world.employees}
+
+    def new_id() -> str:
+        while True:
+            eid = f"E-{prng.randint(10000, 99999)}"
+            if eid not in used_ids:
+                used_ids.add(eid)
+                return eid
+
+    other_dept = prng.choice([d for d in DEPARTMENTS if d != target.department])
+    twin = Employee(new_id(), target.first, target.last, other_dept,
+                    DEPARTMENTS[other_dept][1], DEPARTMENTS[other_dept][0],
+                    manager=prng.choice(world.employees).name, prev_manager="",
+                    start_date=date(2014, 5, 12), office=prng.choice(OFFICES),
+                    email=f"{target.first.lower()}.{target.last.lower()}2@{world.domain}")
+    similar_last = target.last + ("g" if not target.last.endswith("g") else "s")
+    lookalike = Employee(new_id(), target.first, similar_last, target.department,
+                         target.prev_title, target.prev_title, manager=target.prev_manager,
+                         start_date=target.start_date + timedelta(days=200), office=target.office,
+                         email=f"{target.first.lower()}.{similar_last.lower()}@{world.domain}")
+    used_names.add(lookalike.name)
+    pairs = [
+        (employee_doc(world, twin, status="Terminated"), _employee_answer(twin)),
+        (employee_doc(world, lookalike), _employee_answer(lookalike)),
+    ]
+    return pairs, prng, used_ids, used_names
+
+
 def build_retrieve(world: World, task_seed: int) -> TaskInstance:
     rng = keyed_rng("task", world.seed, task_seed, "retrieve")
     target = rng.choice(world.employees)
@@ -85,11 +123,15 @@ def build_retrieve(world: World, task_seed: int) -> TaskInstance:
         f"Find the current HR record for {target.name} in the {target.department} department. "
         "Report their employee ID, current job title, and current manager."
     )
+    stale = employee_doc(world, target, superseded=True)
+    confusable, _, _, _ = _retrieve_confusable(world, target, task_seed)
+    decoys = {stale.doc_id: _employee_answer(target, superseded=True)}
+    decoys.update({d.doc_id: a for d, a in confusable})
 
     def near_pool() -> Iterator[Doc]:
-        prng = keyed_rng("near", world.seed, task_seed, "retrieve")
-        used_ids = {e.employee_id for e in world.employees}
-        used_names = {e.name for e in world.employees}
+        pairs, prng, used_ids, used_names = _retrieve_confusable(world, target, task_seed)
+        for doc, _ in pairs:
+            yield doc
 
         def new_id() -> str:
             while True:
@@ -97,21 +139,6 @@ def build_retrieve(world: World, task_seed: int) -> TaskInstance:
                 if eid not in used_ids:
                     used_ids.add(eid)
                     return eid
-
-        other_dept = prng.choice([d for d in DEPARTMENTS if d != target.department])
-        twin = Employee(new_id(), target.first, target.last, other_dept,
-                        DEPARTMENTS[other_dept][1], DEPARTMENTS[other_dept][0],
-                        manager=prng.choice(world.employees).name, prev_manager="",
-                        start_date=date(2014, 5, 12), office=prng.choice(OFFICES),
-                        email=f"{target.first.lower()}.{target.last.lower()}2@{world.domain}")
-        yield employee_doc(world, twin, status="Terminated")
-
-        similar_last = target.last + ("g" if not target.last.endswith("g") else "s")
-        lookalike = Employee(new_id(), target.first, similar_last, target.department,
-                             target.prev_title, target.prev_title, manager=target.prev_manager,
-                             start_date=target.start_date + timedelta(days=200), office=target.office,
-                             email=f"{target.first.lower()}.{similar_last.lower()}@{world.domain}")
-        yield employee_doc(world, lookalike)
 
         others = [e for e in world.employees if e is not target]
         prng.shuffle(others)
@@ -137,11 +164,12 @@ def build_retrieve(world: World, task_seed: int) -> TaskInstance:
         task_id=f"retrieve-w{world.seed}-t{task_seed}",
         prompt=_full_prompt(question, schema, "Use the employee's current record, not an outdated one.\n\n"),
         answer_schema=schema,
-        ground_truth={"employee_id": target.employee_id, "job_title": target.title, "manager": target.manager},
+        ground_truth=_employee_answer(target),
         required=[employee_doc(world, target)],
         inherent_traps=[],
-        stale_candidates=[employee_doc(world, target, superseded=True)],
+        stale_candidates=[stale],
         near_pool=near_pool,
+        decoy_answers=_distinct_decoys("retrieve", decoys, _employee_answer(target)),
     )
 
 
@@ -209,7 +237,8 @@ def _reconcile_parts(world: World, task_seed: int, stream: str):
     stale_as_of = max(p.date for p in target_payments) - timedelta(days=1) if target_payments else date(2026, 6, 30)
     stale_ledger = ledger_doc(world, world.payments, stale_as_of, doc_id=f"ledger-stale:{stale_as_of}",
                               stem="payment_ledger_2026_old")
-    drafts = [invoice_doc(world, i, draft_items=_draft_items(i.items, rng)) for i in invoices]
+    draft_specs = [(i, _draft_items(i.items, rng)) for i in invoices]
+    drafts = [invoice_doc(world, i, draft_items=items) for i, items in draft_specs]
 
     def near_pool() -> Iterator[Doc]:
         prng = keyed_rng("near", world.seed, task_seed, stream)
@@ -233,7 +262,26 @@ def _reconcile_parts(world: World, task_seed: int, stream: str):
             yield invoice_doc(world, _synthetic_2025_invoice(world, k))
             k += 1
 
-    return client, q, invoices, outstanding, unpaid, ledger, stale_ledger, drafts, near_pool
+    return client, q, invoices, outstanding, unpaid, ledger, stale_ledger, drafts, draft_specs, stale_as_of, near_pool
+
+
+def _outstanding_answer(outstanding: dict[str, int], *, workflow: bool) -> dict:
+    unpaid = sorted(k for k, v in outstanding.items() if v > 0)
+    if workflow:
+        return {"rows": [{"invoice_id": k, "amount_due": plain_money(outstanding[k])} for k in unpaid]}
+    return {"outstanding_balance": round(sum(outstanding.values()) / 100, 2), "unpaid_invoices": unpaid}
+
+
+def _reconcile_decoys(world: World, invoices: list[Invoice], outstanding: dict[str, int],
+                      stale_ledger: Doc, stale_as_of: date, draft_specs, *, workflow: bool) -> dict[str, dict]:
+    decoys = {}
+    stale_out = {i.invoice_id: i.total_cents - world.paid_cents(i.invoice_id, as_of=stale_as_of) for i in invoices}
+    decoys[stale_ledger.doc_id] = _outstanding_answer(stale_out, workflow=workflow)
+    for inv, items in draft_specs:
+        alt = dict(outstanding)
+        alt[inv.invoice_id] = sum(q * u for _, q, u in items) - world.paid_cents(inv.invoice_id)
+        decoys[invoice_doc(world, inv, draft_items=items).doc_id] = _outstanding_answer(alt, workflow=workflow)
+    return decoys
 
 
 def _quarter_range(q: int) -> tuple[date, date]:
@@ -242,7 +290,7 @@ def _quarter_range(q: int) -> tuple[date, date]:
 
 
 def build_reconcile(world: World, task_seed: int) -> TaskInstance:
-    client, q, invoices, outstanding, unpaid, ledger, stale_ledger, drafts, near_pool = _reconcile_parts(
+    client, q, invoices, outstanding, unpaid, ledger, stale_ledger, drafts, draft_specs, stale_as_of, near_pool = _reconcile_parts(
         world, task_seed, "reconcile")
     start, end = _quarter_range(q)
     schema = {
@@ -270,11 +318,16 @@ def build_reconcile(world: World, task_seed: int) -> TaskInstance:
         inherent_traps=[],
         stale_candidates=[stale_ledger, *drafts],
         near_pool=near_pool,
+        decoy_answers=_distinct_decoys(
+            "reconcile",
+            _reconcile_decoys(world, invoices, outstanding, stale_ledger, stale_as_of, draft_specs, workflow=False),
+            {"outstanding_balance": round(sum(outstanding.values()) / 100, 2), "unpaid_invoices": unpaid},
+        ),
     )
 
 
 def build_workflow(world: World, task_seed: int) -> TaskInstance:
-    client, q, invoices, outstanding, unpaid, ledger, stale_ledger, drafts, near_pool = _reconcile_parts(
+    client, q, invoices, outstanding, unpaid, ledger, stale_ledger, drafts, draft_specs, stale_as_of, near_pool = _reconcile_parts(
         world, task_seed, "workflow")
     start, end = _quarter_range(q)
     out_rel = f"reports/unpaid_{slug(client)}_q{q}_2026.csv"
@@ -302,6 +355,11 @@ def build_workflow(world: World, task_seed: int) -> TaskInstance:
         stale_candidates=[stale_ledger, *drafts],
         near_pool=near_pool,
         output_path=out_rel,
+        decoy_answers=_distinct_decoys(
+            "workflow",
+            _reconcile_decoys(world, invoices, outstanding, stale_ledger, stale_as_of, draft_specs, workflow=True),
+            {"rows": [{"invoice_id": k, "amount_due": plain_money(outstanding[k])} for k in unpaid]},
+        ),
     )
 
 
@@ -311,6 +369,14 @@ def build_workflow(world: World, task_seed: int) -> TaskInstance:
 
 VENDOR_A = ["Apex", "Summit", "Pioneer", "Atlas", "Beacon", "Crest", "Meridian", "Harbor"]
 VENDOR_B = ["Supply", "Logistics", "Software", "Staffing", "Facilities", "Media"]
+
+
+def _contract_answer(c: Contract) -> dict:
+    return {
+        "contract_id": c.contract_id,
+        "renewal_date": c.renewal_date.isoformat(),
+        "annual_value": round(c.annual_value_cents / 100, 2),
+    }
 
 
 def _alt_contract(c: Contract, rng) -> Contract:
@@ -327,12 +393,15 @@ def build_conflict(world: World, task_seed: int) -> TaskInstance:
     signed_on = c.effective_date - timedelta(days=rng.randint(3, 20))
     executed = contract_doc(world, c, doc_id=f"contract:{c.contract_id}", stem=f"msa_{s}_signed",
                             status="EXECUTED - in force", signed_on=signed_on)
-    draft_v1 = contract_doc(world, _alt_contract(c, rng), doc_id=f"contract-draft1:{c.contract_id}",
+    c_draft = _alt_contract(c, rng)
+    c_final = _alt_contract(c, rng)
+    c_redline = _alt_contract(c, rng)
+    draft_v1 = contract_doc(world, c_draft, doc_id=f"contract-draft1:{c.contract_id}",
                             stem=f"msa_{s}_draft_v1", status="DRAFT v1 - for discussion only", signed_on=None)
-    final_unsigned = contract_doc(world, _alt_contract(c, rng), doc_id=f"contract-final:{c.contract_id}",
+    final_unsigned = contract_doc(world, c_final, doc_id=f"contract-final:{c.contract_id}",
                                   stem=f"msa_{s}_final", status="FINAL DRAFT - pending signature",
                                   signed_on=None)
-    redline = contract_doc(world, _alt_contract(c, rng), doc_id=f"contract-redline:{c.contract_id}",
+    redline = contract_doc(world, c_redline, doc_id=f"contract-redline:{c.contract_id}",
                            stem=f"msa_{s}_redline_v3", status="REDLINE v3 - superseded", signed_on=None)
     prior = world.prior_contracts[client]
     expired = contract_doc(world, prior, doc_id=f"contract-prior:{prior.contract_id}",
@@ -393,6 +462,18 @@ def build_conflict(world: World, task_seed: int) -> TaskInstance:
         inherent_traps=[draft_v1, final_unsigned],
         stale_candidates=[redline, expired],
         near_pool=near_pool,
+        decoy_answers=_distinct_decoys("conflict", {
+            draft_v1.doc_id: _contract_answer(c_draft),
+            final_unsigned.doc_id: _contract_answer(c_final),
+            redline.doc_id: _contract_answer(c_redline),
+            expired.doc_id: _contract_answer(prior),
+            **{f"contract:{oc.contract_id}": _contract_answer(oc)
+               for other, oc in world.contracts.items() if other != client},
+        }, {
+            "contract_id": c.contract_id,
+            "renewal_date": c.renewal_date.isoformat(),
+            "annual_value": round(c.annual_value_cents / 100, 2),
+        }),
     )
 
 
@@ -431,6 +512,39 @@ def parse_date(v) -> date | None:
 def _money_eq(a, b) -> bool:
     pa, pb = parse_money(a), parse_money(b)
     return pa is not None and pb is not None and abs(pa - pb) <= 0.01
+
+
+def _decoy_differs(task_type: str, decoy: dict, gt: dict) -> bool:
+    if task_type == "workflow":
+        return decoy.get("rows") != gt.get("rows")
+    if task_type == "reconcile":
+        return not (_money_eq(decoy.get("outstanding_balance"), gt.get("outstanding_balance"))
+                    and decoy.get("unpaid_invoices") == gt.get("unpaid_invoices"))
+    if task_type == "conflict":
+        return not (_money_eq(decoy.get("annual_value"), gt.get("annual_value"))
+                    and decoy.get("renewal_date") == gt.get("renewal_date")
+                    and _norm(decoy.get("contract_id", "")) == _norm(gt.get("contract_id", "")))
+    return any(_norm(decoy.get(k, "")) != _norm(gt.get(k, "")) for k in ("employee_id", "job_title", "manager"))
+
+
+def _distinct_decoys(task_type: str, decoys: dict[str, dict], gt: dict) -> dict[str, dict]:
+    return {k: v for k, v in decoys.items() if _decoy_differs(task_type, v, gt)}
+
+
+def extract_decoy(task_type: str, doc: Doc) -> dict | None:
+    """Best-effort decoy from a document's fields (used for near-miss files)."""
+    f = dict(doc.fields)
+    if task_type == "retrieve" and doc.kind == "employee":
+        return {"employee_id": f.get("Employee ID"), "job_title": f.get("Job title"), "manager": f.get("Manager")}
+    if task_type == "conflict" and doc.kind == "contract":
+        return {
+            "contract_id": f.get("Agreement number"),
+            "renewal_date": f.get("Renewal date"),
+            "annual_value": parse_money(f.get("Annual contract value")),
+        }
+    if task_type in ("reconcile", "workflow") and doc.kind == "invoice":
+        return {"outstanding_balance": parse_money(f.get("Total due")), "invoice_id": f.get("Invoice number")}
+    return None
 
 
 def _fields_result(checks: dict[str, bool]) -> dict:

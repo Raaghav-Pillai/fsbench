@@ -8,7 +8,16 @@ import sys
 from pathlib import Path
 
 from fsbench.config import PRESETS, FSConfig
-from fsbench.evaluate import SUMMARY_METRICS, evaluate_runs, find_envs, summarize
+from fsbench.evaluate import (
+    SUMMARY_METRICS,
+    balance_warnings,
+    evaluate_runs,
+    find_envs,
+    keep_paired,
+    mixed_version_warnings,
+    select_envs,
+    summarize,
+)
 from fsbench.generate import generate_env
 from fsbench.paths import long_path
 from fsbench.runner import OracleAgent, run_agent
@@ -55,10 +64,22 @@ def _config_args(p: argparse.ArgumentParser) -> None:
                         "--set mime_diversity=4. Repeatable.")
 
 
+def _generate_label(preset: str | None, sets: list[tuple[str, str]], label: str | None) -> str:
+    if label:
+        return label
+    extras = ",".join(f"{k}={v}" for k, v in sets)
+    if preset and extras:
+        return f"{preset}:{extras}"
+    if preset:
+        return preset
+    return f"custom:{extras}" if extras else "default"
+
+
 def cmd_generate(a) -> None:
     cfg = build_config(a.preset, a.sets)
     ws, ts, ls = (a.seed if s is None else s for s in (a.world_seed, a.task_seed, a.layout_seed))
-    m = generate_env(a.task, cfg, a.out, world_seed=ws, task_seed=ts, layout_seed=ls)
+    m = generate_env(a.task, cfg, a.out, world_seed=ws, task_seed=ts, layout_seed=ls,
+                     label=_generate_label(a.preset, a.sets, a.label))
     print(f"Generated {m['env_id']}: {m['stats']['n_files']} files in {m['stats']['n_dirs']} folders")
     print(f"  workspace: {Path(a.out) / 'workspace'}")
     print(f"  task:      {Path(a.out) / 'task.json'}")
@@ -106,9 +127,9 @@ FATAL_API_ERRORS = ("HTTP 401", "HTTP 402", "HTTP 403", "No OpenRouter API key")
 def cmd_run(a) -> None:
     from fsbench.openrouter import OpenRouterAgent
 
-    envs = find_envs(a.envs)[: a.limit] if a.limit else find_envs(a.envs)
+    envs = select_envs(find_envs(a.envs), replicates=a.replicates, only=a.only)
     if not envs:
-        sys.exit(f"no environments found under {a.envs}")
+        sys.exit(f"no environments found under {a.envs} (check --replicates / --only)")
     try:
         agent = OpenRouterAgent(a.model, max_steps=a.max_steps, temperature=a.temperature)
     except RuntimeError as e:
@@ -130,7 +151,7 @@ def cmd_run(a) -> None:
             solved += m["success"]
             status = "PASS" if m["success"] else "FAIL"
             print(f"  {status} {run_name} [{ts}] score={m['score']:.2f} calls={m['n_calls']} "
-                  f"regret={m['navigation_regret']} cost=${cost:.4f}", flush=True)
+                  f"discovery_regret={m['discovery_regret']} cost=${cost:.4f}", flush=True)
             err = meta.get("agent_error") or ""
             if err:
                 print("    agent error: " + err.strip().splitlines()[-1])
@@ -156,9 +177,32 @@ def cmd_evaluate(a) -> None:
     rows = evaluate_runs(a.runs, a.out)
     if not rows:
         sys.exit(f"no runs found under {a.runs}")
+    if a.paired:
+        before = len(rows)
+        rows = keep_paired(rows)
+        print(f"Paired filter: kept {len(rows)}/{before} runs")
+    for w in balance_warnings(rows) + mixed_version_warnings(rows):
+        print(f"warning: {w}", file=sys.stderr)
     print(f"Evaluated {len(rows)} runs" + (f"; wrote {a.out}" if a.out else ""))
-    by = tuple(a.group_by.split(",")) if a.group_by else ("agent", "toolset", "task_type", "sweep.vars")
+    by = tuple(a.group_by.split(",")) if a.group_by else ("agent", "toolset", "task_type", "condition")
     _print_table(summarize(rows, by))
+
+
+def cmd_plot(a) -> None:
+    from fsbench.plot import plot_runs
+
+    rows = evaluate_runs(a.runs)
+    if not rows:
+        sys.exit(f"no runs found under {a.runs}")
+    if a.paired:
+        rows = keep_paired(rows)
+    try:
+        paths = plot_runs(rows, a.x, a.out)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    print(f"Wrote {len(paths)} plots under {a.out}")
+    for p in paths:
+        print(f"  {p}")
 
 
 def cmd_context(a) -> None:
@@ -196,6 +240,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--world-seed", type=int)
     p.add_argument("--task-seed", type=int)
     p.add_argument("--layout-seed", type=int)
+    p.add_argument("--label", help="condition label stored in the manifest (default: preset or custom:overrides)")
     _config_args(p)
     p.set_defaults(fn=cmd_generate)
 
@@ -222,7 +267,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--toolset", nargs="+", default=["files"], choices=sorted(TOOLSETS))
     p.add_argument("--max-steps", type=int, default=40, help="maximum model turns per run")
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--limit", type=int, help="only run the first N environments")
+    p.add_argument("--replicates", type=int, help="keep environments with sweep.replicate < N (balanced seeds)")
+    p.add_argument("--only", help="keep environments from one swept variable, e.g. depth")
     p.add_argument("--no-writes", action="store_true", help="disable write_file (scratch-memory ablation)")
     p.add_argument("--skip-existing", action="store_true", help="skip runs that already have metrics.json")
     p.set_defaults(fn=cmd_run)
@@ -230,9 +276,17 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("evaluate", help="score runs and summarise")
     p.add_argument("--runs", required=True)
     p.add_argument("--out", help="write per-run CSV here")
-    p.add_argument("--group-by", help=f"comma-separated columns (default agent,toolset,task_type,sweep.vars); "
+    p.add_argument("--paired", action="store_true", help="drop seeds that are missing from any condition")
+    p.add_argument("--group-by", help=f"comma-separated columns (default agent,toolset,task_type,condition); "
                                       f"summary metrics: {', '.join(SUMMARY_METRICS)}")
     p.set_defaults(fn=cmd_evaluate)
+
+    p = sub.add_parser("plot", help="plot success/calls/tokens/cost/latency against one variable")
+    p.add_argument("--runs", required=True)
+    p.add_argument("--x", required=True, help="filesystem variable, e.g. depth or filename_noise")
+    p.add_argument("--out", required=True, help="directory for PNG files")
+    p.add_argument("--paired", action="store_true")
+    p.set_defaults(fn=cmd_plot)
 
     p = sub.add_parser("context", help="dump every file as one text block (no-filesystem condition)")
     p.add_argument("--env", required=True)

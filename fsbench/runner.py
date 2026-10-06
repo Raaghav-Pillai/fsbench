@@ -21,6 +21,7 @@ from typing import Protocol
 
 from fsbench.evaluate import evaluate_run, parse_answer
 from fsbench.paths import long_path
+from fsbench.provenance import snapshot
 from fsbench.tools import VROOT, ToolSet, Tracer, make_toolset
 
 
@@ -51,6 +52,7 @@ def run_agent(
     run.mkdir(parents=True)
     shutil.copytree(env / "workspace", run / "workspace")
     task = json.loads((env / "task.json").read_text(encoding="utf-8"))
+    manifest = json.loads((env / "manifest.json").read_text(encoding="utf-8"))
 
     tracer = Tracer(run / "trace.jsonl")
     tools = make_toolset(toolset, run / "workspace", tracer,
@@ -69,12 +71,25 @@ def run_agent(
     transcript = getattr(agent, "transcript", None)
     if transcript:
         (run / "transcript.json").write_text(json.dumps(transcript, indent=2), encoding="utf-8")
+    describe = getattr(agent, "describe", None)
+    agent_describe = describe() if callable(describe) else None
+    sweep = manifest.get("sweep") or {}
     (run / "meta.json").write_text(json.dumps({
         "env_dir": str(Path(env_dir).resolve()),
+        "env_id": manifest.get("env_id"),
         "agent": agent.name,
+        "agent_describe": agent_describe,
+        "model": (agent_describe or {}).get("model"),
+        "task": manifest["task"]["type"],
         "toolset": toolset,
         "allow_writes": allow_writes,
         "max_output_chars": max_output_chars,
+        "world_seed": manifest["seeds"]["world"],
+        "seeds": manifest["seeds"],
+        "config": manifest["config"],
+        "condition": manifest.get("condition"),
+        "sweep_replicate": sweep.get("replicate"),
+        **snapshot(),
         "wall_time_s": round(wall, 3),
         "agent_error": error,
         "raw_answer": raw if isinstance(raw, str) else None,
@@ -89,7 +104,7 @@ class OracleAgent:
     """Reads exactly one copy of each required doc and submits the ground truth.
 
     Validates that an environment is solvable through a given toolset and that the
-    evaluator scores a perfect run as success with navigation regret 1.0.
+    evaluator scores a perfect run as success with known_path_regret 1.0.
     """
 
     name = "oracle"
@@ -97,6 +112,9 @@ class OracleAgent:
 
     def __init__(self, manifest: dict):
         self.manifest = manifest
+
+    def describe(self) -> dict:
+        return {"kind": "oracle"}
 
     def run(self, prompt: str, tools: ToolSet) -> dict:
         m = self.manifest

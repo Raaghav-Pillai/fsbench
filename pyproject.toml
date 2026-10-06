@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+plot = ["matplotlib>=3.8"]
 
 [project.scripts]
 fsbench = "fsbench.cli:main"
