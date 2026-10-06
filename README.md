@@ -4,7 +4,7 @@ A benchmark for measuring how filesystem organization affects AI agents' ability
 
 Agents retrieve information, reconcile records, resolve conflicting documents, and produce output files. The benchmark tracks task success, tool calls, tokens, cost, and latency.
 
-Blog post: URL to be added.
+Blog post: (https://raaghav-pillai.github.io/benchmarks/fsbench/)
 
 ## Quick start
 
