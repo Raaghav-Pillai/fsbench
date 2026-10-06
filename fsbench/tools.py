@@ -150,7 +150,8 @@ class ToolSet:
 
     def call(self, name: str, args: dict | None = None) -> str:
         args = dict(args or {})
-        self._cur = {"read": [], "seen": [], "missing": [], "written": [], "path_args": [0]}
+        self._cur = {"read": [], "seen": [], "missing": [], "written": [], "path_args": [0],
+                     "parse_ms": [0.0], "index_build_ms": [0.0]}
         start = time.perf_counter()
         error = None
         try:
@@ -182,6 +183,8 @@ class ToolSet:
             "output_chars": len(text),
             "truncated": truncated,
             "duration_ms": round((time.perf_counter() - start) * 1000, 2),
+            "parse_ms": round(self._cur["parse_ms"][0], 2),
+            "index_build_ms": round(self._cur["index_build_ms"][0], 2) or None,
         })
         return text
 
@@ -253,10 +256,12 @@ class ToolSet:
         hit = self._text_cache.get(rel)
         if hit and hit[0] == key:
             return hit[1]
+        t0 = time.perf_counter()
         try:
             text = extract_text(os_path)
         except Exception as e:
             raise ToolError(f"{self._v(rel)}: could not extract text ({e})")
+        self._cur.setdefault("parse_ms", [0.0])[0] += (time.perf_counter() - t0) * 1000
         self._text_cache[rel] = (key, text)
         return text
 
@@ -441,7 +446,9 @@ class IndexedTools(FileTools):
 
     def _t_search_index(self, query: str, k: int = 10) -> str:
         if self._index is None:
+            t0 = time.perf_counter()
             self._index = self._build_index()
+            self._cur.setdefault("index_build_ms", [0.0])[0] = (time.perf_counter() - t0) * 1000
         idx = self._index
         terms = list(dict.fromkeys(_tokens(query)))
         if not terms:

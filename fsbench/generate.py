@@ -10,6 +10,7 @@ Output layout::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import shutil
@@ -20,7 +21,7 @@ from fsbench.config import FSConfig
 from fsbench.layout import Entry, place_entries, select_entries
 from fsbench.paths import long_path
 from fsbench.render import render
-from fsbench.tasks import TASK_TYPES
+from fsbench.tasks import TASK_TYPES, extract_decoy
 from fsbench.world import build_world
 
 MANIFEST_VERSION = 1
@@ -36,6 +37,7 @@ def generate_env(
     layout_seed: int = 0,
     env_id: str | None = None,
     sweep: dict | None = None,
+    label: str | None = None,
 ) -> dict:
     if task_type not in TASK_TYPES:
         raise ValueError(f"unknown task type {task_type!r}; choose from {sorted(TASK_TYPES)}")
@@ -74,6 +76,14 @@ def generate_env(
     required_ids = [d.doc_id for d in task.required]
     trap_ids = sorted({e.doc.doc_id for e in entries if e.role == "trap"})
     env_id = env_id or Path(out_dir).name
+    present = {f["doc_id"] for f in files}
+    decoys = {k: v for k, v in task.decoy_answers.items() if k in present}
+    by_id = {e.doc.doc_id: e.doc for e in entries}
+    for f in files:
+        if f["role"] in ("trap", "near") and f["doc_id"] not in decoys:
+            extra = extract_decoy(task.task_type, by_id[f["doc_id"]])
+            if extra:
+                decoys[f["doc_id"]] = extra
     manifest = {
         "manifest_version": MANIFEST_VERSION,
         "env_id": env_id,
@@ -88,9 +98,11 @@ def generate_env(
         "ground_truth": task.ground_truth,
         "seeds": {"world": world_seed, "task": task_seed, "layout": layout_seed},
         "config": cfg.to_dict(),
+        "condition": _condition(cfg, label, sweep),
         "sweep": sweep,
         "required_doc_ids": required_ids,
         "trap_doc_ids": trap_ids,
+        "decoy_answers": decoys,
         "oracle": _oracle_costs(entries, required_ids, task.output_path),
         "stats": _structure_stats(entries, files),
         "files": files,
@@ -103,13 +115,25 @@ def generate_env(
     return manifest
 
 
+def _condition(cfg: FSConfig, label: str | None, sweep: dict | None) -> dict:
+    if sweep and sweep.get("vars"):
+        cond_label = ";".join(f"{k}={v}" for k, v in sweep["vars"].items())
+    else:
+        cond_label = label or "default"
+    dumped = json.dumps(cfg.to_dict(), sort_keys=True, default=str)
+    return {"label": cond_label, "config_hash": hashlib.sha1(dumped.encode()).hexdigest()[:8]}
+
+
 def _oracle_costs(entries: list[Entry], required_ids: list[str], output_path: str | None) -> dict:
     """Lower bounds on tool calls.
 
-    optimal_calls       a path-omniscient agent: one read per required doc (+ one write).
-    browse_lower_bound  an agent that knows what it needs but must find it by listing
-                        directories from the root: every ancestor folder of the shallowest
-                        copy of each required doc is listed once, then each doc is read.
+    known_path_optimal_calls  a path-omniscient agent: one read per required doc (+ one write).
+    discovery_optimal_calls   an agent that knows what it needs but must find it by listing
+                              directories from the root: every ancestor folder of the shallowest
+                              copy of each required doc is listed once, then each doc is read.
+
+    Toolsets with search can beat discovery_optimal_calls (discovery regret < 1). That is
+    expected and measures how much search helps.
     """
     writes = 1 if output_path else 0
     listed: set[tuple[str, ...]] = set()
@@ -122,8 +146,8 @@ def _oracle_costs(entries: list[Entry], required_ids: list[str], output_path: st
     return {
         "min_reads": reads,
         "min_writes": writes,
-        "optimal_calls": reads + writes,
-        "browse_lower_bound": len(listed) + reads + writes,
+        "known_path_optimal_calls": reads + writes,
+        "discovery_optimal_calls": len(listed) + reads + writes,
     }
 
 

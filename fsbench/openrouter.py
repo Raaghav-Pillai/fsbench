@@ -6,6 +6,7 @@ The API key is read from the ``OPENROUTER_API_KEY`` environment variable, or fro
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -16,6 +17,7 @@ from pathlib import Path
 from fsbench.tools import ToolSet
 
 BASE_URL = "https://openrouter.ai/api/v1"
+AGENT_PROMPT_VERSION = "v1"
 
 SYSTEM_PROMPT = (
     "You are an autonomous agent working on a company file share. Use the provided tools to "
@@ -65,9 +67,22 @@ class OpenRouterAgent:
         self.usage: dict = {}
         self.transcript: list[dict] = []
 
+    def describe(self) -> dict:
+        return {
+            "kind": "openrouter",
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_steps": self.max_steps,
+            "max_tokens": self.max_tokens,
+            "agent_prompt_version": AGENT_PROMPT_VERSION,
+            "system_prompt_sha1": hashlib.sha1(SYSTEM_PROMPT.encode()).hexdigest()[:12],
+        }
+
     def run(self, prompt: str, tools: ToolSet) -> str:
-        self.usage = {"input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "llm_calls": 0,
-                      "hit_step_limit": False}
+        self.usage = {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
+            "llm_calls": 0, "hit_step_limit": False, "llm_latency_s": 0.0, "llm_call_latencies": [],
+        }
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
         self.transcript = messages
         specs = tools.specs("openai")
@@ -106,13 +121,18 @@ class OpenRouterAgent:
         }
         if allow_tools:
             body["tools"] = specs
+        t0 = time.perf_counter()
         data = self._post("/chat/completions", body)
+        dt = time.perf_counter() - t0
+        self.usage["llm_latency_s"] = round(self.usage["llm_latency_s"] + dt, 4)
+        self.usage["llm_call_latencies"].append(round(dt, 4))
         if "error" in data:
             raise RuntimeError(f"OpenRouter error: {data['error']}")
         usage = data.get("usage") or {}
         self.usage["llm_calls"] += 1
         self.usage["input_tokens"] += usage.get("prompt_tokens", 0) or 0
         self.usage["output_tokens"] += usage.get("completion_tokens", 0) or 0
+        self.usage["total_tokens"] = self.usage["input_tokens"] + self.usage["output_tokens"]
         self.usage["cost_usd"] = round(self.usage["cost_usd"] + float(usage.get("cost", 0) or 0), 6)
         choices = data.get("choices") or []
         if not choices:

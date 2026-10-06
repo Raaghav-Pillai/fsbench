@@ -27,7 +27,9 @@ def test_oracle_is_perfect(make_env, tmp_path, task, toolset):
     env, m = make_env(task, PRESETS["horrible"])
     metrics = run_agent(env, OracleAgent(m), tmp_path / "run", toolset=toolset)
     assert metrics["success"] and metrics["score"] == 1.0
-    assert metrics["navigation_regret"] == 1.0
+    assert metrics["known_path_regret"] == 1.0
+    assert metrics["failure_type"] is None
+    assert metrics["evidence_found"]
     assert metrics["required_recall_read"] == 1.0
     assert metrics["read_precision"] == 1.0
     assert metrics["path_hallucination_rate"] == 0.0
@@ -60,7 +62,8 @@ def test_wrong_answer_traps_and_hallucinations_are_measured(make_env, tmp_path):
     assert metrics["files_read"] == 3
     assert metrics["read_precision"] == pytest.approx(1 / 3, abs=1e-3)
     assert metrics["steps_to_first_required"] == 5
-    assert metrics["navigation_regret"] == pytest.approx(6 / m["oracle"]["optimal_calls"], abs=1e-3)
+    assert metrics["known_path_regret"] == pytest.approx(6 / m["oracle"]["known_path_optimal_calls"], abs=1e-3)
+    assert metrics["failure_type"] == "retrieval_failure"
     assert metrics["usage"]["cost_usd"] == 0.001
 
 
@@ -105,7 +108,7 @@ def test_evaluate_runs_and_summary(make_env, tmp_path):
     rows = evaluate_runs(tmp_path / "runs", tmp_path / "results.csv")
     assert len(rows) == 2 and (tmp_path / "results.csv").exists()
     summary = summarize(rows)
-    assert {s["sweep.vars"] for s in summary} == {"preset=organized", "preset=horrible"}
+    assert {s["condition"] for s in summary} == {"preset=organized", "preset=horrible"}
     assert all(s["success"] == 1.0 for s in summary)
 
 
