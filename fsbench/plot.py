@@ -10,9 +10,13 @@ from fsbench.evaluate import mean_se
 PLOT_METRICS = [
     ("success", "Success"),
     ("n_calls", "Tool calls"),
+    ("files_read", "Files read"),
     ("total_tokens", "Total tokens"),
     ("cost_usd", "API cost (USD)"),
     ("wall_time_s", "Wall time (s)"),
+    ("read_precision", "Read precision"),
+    ("steps_to_first_required_evidence", "Steps to first required evidence"),
+    ("candidate_files_seen", "Candidate files seen before required evidence"),
 ]
 
 
@@ -20,11 +24,13 @@ def _series_key(row: dict) -> str:
     parts = [row.get("agent") or "?", row.get("toolset") or "?"]
     if row.get("model"):
         parts[0] = row["model"]
+    if row.get("tool_policy"):
+        parts.append(row["tool_policy"])
     return " / ".join(parts)
 
 
 def _x_value(row: dict, x: str):
-    raw = row.get(f"cfg.{x}")
+    raw = row.get(f"cfg.{x}", row.get(x))
     if raw is None:
         vars_ = row.get("sweep.vars") or row.get("condition") or ""
         prefix = f"{x}="
@@ -35,7 +41,8 @@ def _x_value(row: dict, x: str):
     if raw is None:
         return None
     try:
-        return int(raw)
+        value = float(raw)
+        return int(value) if value.is_integer() else value
     except (TypeError, ValueError):
         try:
             return float(raw)
@@ -52,14 +59,20 @@ def plot_runs(rows: list[dict], x: str, out_dir: str | Path) -> list[Path]:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     written = []
-    grouped: dict[tuple, list[float]] = defaultdict(list)
-    for r in rows:
+    trials: dict[tuple, list[float]] = defaultdict(list)
+    for i, r in enumerate(rows):
         xv = _x_value(r, x)
         if xv is None:
             continue
         for metric, _ in PLOT_METRICS:
             if r.get(metric) is not None:
-                grouped[(_series_key(r), metric, xv)].append(float(r[metric]))
+                world = tuple(r.get("seed." + k) for k in ("world", "task", "layout"))
+                if world == (None, None, None):
+                    world = (i,)
+                trials[(_series_key(r), metric, xv, world)].append(float(r[metric]))
+    grouped: dict[tuple, list[float]] = defaultdict(list)
+    for (series, metric, xv, world), values in trials.items():
+        grouped[(series, metric, xv)].append(sum(values)/len(values))
     if not grouped:
         raise RuntimeError(f"no rows had a value for {x!r}")
 

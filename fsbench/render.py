@@ -5,11 +5,28 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
+import zipfile
 from datetime import datetime, timezone
 
 from fsbench.docs import Doc, Table
 
 FIXED_TIMESTAMP = datetime(2026, 10, 1, 9, 0, 0, tzinfo=timezone.utc)
+
+
+def _stable_office_bytes(data: bytes) -> bytes:
+    """Office libraries stamp ZIP entries (and XLSX modified time) at save time."""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as src, zipfile.ZipFile(out, "w") as dst:
+        for name in sorted(src.namelist()):
+            content = src.read(name)
+            if name == "docProps/core.xml":
+                content = re.sub(rb"(<dcterms:modified\b[^>]*>)[^<]*(</dcterms:modified>)",
+                                 rb"\g<1>2026-10-01T09:00:00Z\g<2>", content)
+            info = zipfile.ZipInfo(name, FIXED_TIMESTAMP.timetuple()[:6])
+            info.compress_type = zipfile.ZIP_DEFLATED
+            dst.writestr(info, content)
+    return out.getvalue()
 
 
 def table_lines(table: Table, sep: str = " | ") -> list[str]:
@@ -131,7 +148,7 @@ def render_xlsx(doc: Doc) -> bytes:
         ws.append([p])
     buf = io.BytesIO()
     wb.save(buf)
-    return buf.getvalue()
+    return _stable_office_bytes(buf.getvalue())
 
 
 def render_docx(doc: Doc) -> bytes:
@@ -157,7 +174,7 @@ def render_docx(doc: Doc) -> bytes:
         d.add_paragraph(p)
     buf = io.BytesIO()
     d.save(buf)
-    return buf.getvalue()
+    return _stable_office_bytes(buf.getvalue())
 
 
 def _latin1(text: str) -> str:

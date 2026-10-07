@@ -54,10 +54,13 @@ class OpenRouterAgent:
         base_url: str = BASE_URL,
         timeout_s: float = 180.0,
         max_retries: int = 4,
+        adapter=None,
+        provider: str = "openrouter",
     ):
         self.model = model
-        self.name = f"openrouter:{model}"
-        self.api_key = api_key or load_api_key()
+        self.provider = provider
+        self.name = f"{provider}:{model}"
+        self.api_key = api_key or ("" if adapter else load_api_key())
         self.max_steps = max_steps
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -66,14 +69,17 @@ class OpenRouterAgent:
         self.max_retries = max_retries
         self.usage: dict = {}
         self.transcript: list[dict] = []
+        from fsbench.models import ChatCompletionsAdapter
+        self.adapter = adapter or ChatCompletionsAdapter(self._post)
 
     def describe(self) -> dict:
         return {
-            "kind": "openrouter",
+            "kind": self.provider,
             "model": self.model,
             "temperature": self.temperature,
             "max_steps": self.max_steps,
             "max_tokens": self.max_tokens,
+            "base_url": self.base_url,
             "agent_prompt_version": AGENT_PROMPT_VERSION,
             "system_prompt_sha1": hashlib.sha1(SYSTEM_PROMPT.encode()).hexdigest()[:12],
         }
@@ -82,12 +88,17 @@ class OpenRouterAgent:
         self.usage = {
             "input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "cost_usd": 0.0,
             "llm_calls": 0, "hit_step_limit": False, "llm_latency_s": 0.0, "llm_call_latencies": [],
+            "finish_reasons": [], "provider_errors": [],
         }
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
+        from fsbench.policies import instructions
+        policy_prompt = instructions(tools.tool_policy)
+        system = SYSTEM_PROMPT + ("\n" + policy_prompt if policy_prompt else "")
+        messages: list[dict] = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
         self.transcript = messages
         specs = tools.specs("openai")
         last_text = ""
         for _ in range(self.max_steps):
+            specs = tools.specs("openai")
             msg = self._complete(messages, specs)
             last_text = msg.get("content") or last_text
             calls = msg.get("tool_calls") or []
@@ -101,9 +112,9 @@ class OpenRouterAgent:
                 fn = call.get("function", {})
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
-                    result = tools.call(fn.get("name", ""), args if isinstance(args, dict) else {})
+                    result = tools.call(fn.get("name", ""), args)
                 except json.JSONDecodeError as e:
-                    result = f"Error: tool arguments were not valid JSON ({e})"
+                    result = tools.call(fn.get("name", ""), {}, argument_error=f"tool arguments were not valid JSON ({e})")
                 messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
         self.usage["hit_step_limit"] = True
         messages.append({"role": "user", "content": "Step limit reached. Reply now with only your final JSON answer."})
@@ -114,30 +125,27 @@ class OpenRouterAgent:
     def _complete(self, messages: list[dict], specs: list[dict], allow_tools: bool = True) -> dict:
         body = {
             "model": self.model,
-            "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "usage": {"include": True},
         }
-        if allow_tools:
-            body["tools"] = specs
-        t0 = time.perf_counter()
-        data = self._post("/chat/completions", body)
-        dt = time.perf_counter() - t0
+        if self.provider == "openrouter":
+            body["usage"] = {"include": True}
+        response = self.adapter.run(messages, specs if allow_tools else [], body)
+        dt = response.latency_s
         self.usage["llm_latency_s"] = round(self.usage["llm_latency_s"] + dt, 4)
         self.usage["llm_call_latencies"].append(round(dt, 4))
-        if "error" in data:
-            raise RuntimeError(f"OpenRouter error: {data['error']}")
-        usage = data.get("usage") or {}
         self.usage["llm_calls"] += 1
-        self.usage["input_tokens"] += usage.get("prompt_tokens", 0) or 0
-        self.usage["output_tokens"] += usage.get("completion_tokens", 0) or 0
-        self.usage["total_tokens"] = self.usage["input_tokens"] + self.usage["output_tokens"]
-        self.usage["cost_usd"] = round(self.usage["cost_usd"] + float(usage.get("cost", 0) or 0), 6)
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"OpenRouter returned no choices: {json.dumps(data)[:500]}")
-        return choices[0].get("message") or {}
+        self.usage["finish_reasons"].append(response.finish_reason)
+        for field in ("input_tokens", "output_tokens", "cost_usd"):
+            value = getattr(response, field)
+            prior = self.usage[field]
+            self.usage[field] = round(prior + value, 8) if prior is not None and value is not None else None
+        self.usage["total_tokens"] = (self.usage["input_tokens"] + self.usage["output_tokens"]
+            if self.usage["input_tokens"] is not None and self.usage["output_tokens"] is not None else None)
+        if response.error:
+            self.usage["provider_errors"].append(response.error)
+            raise RuntimeError(response.error)
+        return {"content": response.content, "tool_calls": response.tool_calls}
 
     def _post(self, path: str, body: dict) -> dict:
         req = urllib.request.Request(

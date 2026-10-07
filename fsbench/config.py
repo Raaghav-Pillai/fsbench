@@ -14,7 +14,9 @@ class FSConfig:
     depth               Directory levels above every file. None keeps each document's
                         natural semantic depth; smaller values truncate the semantic path,
                         larger values pad it with filler folders (archive/, misc/, ...).
-    filename_noise      Probability a file loses its descriptive name (final_v2_NEW(3).pdf).
+    filename_noise      Fraction selected by world-seeded document thresholds; selected
+                        names lose status/IDs, then context, then document type at
+                        1/3 and 2/3. Zero preserves names; one degrades every name.
     dirname_noise       Probability a folder loses its descriptive name (New folder/, stuff/).
     scatter             Probability a file lands in a junk location (downloads/, desktop/, temp/).
     distractors         Number of irrelevant documents added.
@@ -80,6 +82,13 @@ class FSConfig:
 
 
 PRESETS: dict[str, FSConfig] = {
+    "clean": FSConfig(depth=0, semantic_similarity=0),
+    "navigation_stress": FSConfig(depth=10, filename_noise=.8, distractors=100),
+    "ambiguity_stress": FSConfig(filename_noise=.8, distractors=100,
+                                semantic_similarity=.9, stale_version_rate=.5, duplicate_rate=.3),
+    "max_stress": FSConfig(depth=10, filename_noise=.9, dirname_noise=.8, scatter=.8,
+                          distractors=300, semantic_similarity=.9, duplicate_rate=.5,
+                          stale_version_rate=1, mime_types=ALL_FORMATS),
     "organized": FSConfig(mime_types=("txt", "csv", "pdf")),
     "moderate": FSConfig(
         depth=5,

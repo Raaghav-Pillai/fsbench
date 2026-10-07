@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fsbench"
-version = "0.1.0"
+version = "0.3.0"
 description = "FS-EntropyBench: measure how filesystem structure affects agent task performance"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,6 +23,9 @@ fsbench = "fsbench.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["fsbench*"]
+
+[tool.setuptools.package-data]
+fsbench = ["packs/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -63,6 +63,8 @@ def _param(type_: str, description: str, default: Any = ..., **extra) -> dict:
 
 
 SPECS: dict[str, tuple[str, dict[str, dict], list[str]]] = {
+    "stat_file": ("Show file size and filesystem modification time (copy times may not establish authority).",
+                  {"path": _param("string", "File path.")}, ["path"]),
     "ls": ("List a directory (directories end with '/').",
            {"path": _param("string", "Directory or file path.", "."),
             "long": _param("boolean", "Also show file sizes in bytes.", False)}, []),
@@ -101,6 +103,7 @@ SPECS: dict[str, tuple[str, dict[str, dict], list[str]]] = {
 }
 
 TOOL_CATEGORY = {
+    "stat_file": "navigate",
     "ls": "navigate", "cd": "navigate", "pwd": "navigate", "find": "navigate",
     "list_directory": "navigate", "glob": "navigate",
     "grep": "search", "search_files": "search", "search_index": "search",
@@ -120,7 +123,14 @@ class ToolSet:
         *,
         allow_writes: bool = True,
         max_output_chars: int = 20000,
+        tool_policy: str = "naturalistic",
+        include_timestamps: bool = False,
     ):
+        from fsbench.policies import validate_policy
+        validate_policy(self.name, tool_policy)
+        self.tool_policy = tool_policy
+        self._index_used = False
+        self.include_timestamps = include_timestamps
         self.root = long_path(root)
         if not self.root.is_dir():
             raise FileNotFoundError(root)
@@ -133,7 +143,9 @@ class ToolSet:
 
     @property
     def available(self) -> tuple[str, ...]:
-        return self.tool_names + (("write_file",) if self.allow_writes else ())
+        if self.tool_policy == "index_first" and not self._index_used:
+            return ("search_index",)
+        return self.tool_names + (("stat_file",) if self.include_timestamps else ()) + (("write_file",) if self.allow_writes else ())
 
     def specs(self, style: str = "anthropic") -> list[dict]:
         out = []
@@ -148,13 +160,18 @@ class ToolSet:
                 raise ValueError(f"unknown spec style {style!r}")
         return out
 
-    def call(self, name: str, args: dict | None = None) -> str:
+    def call(self, name: str, args: dict | None = None, *, argument_error: str | None = None) -> str:
+        if args is not None and not isinstance(args, dict):
+            argument_error = "tool arguments must be a JSON object"
+            args = {}
         args = dict(args or {})
         self._cur = {"read": [], "seen": [], "missing": [], "written": [], "path_args": [0],
                      "parse_ms": [0.0], "index_build_ms": [0.0]}
         start = time.perf_counter()
         error = None
         try:
+            if argument_error:
+                raise ToolError(argument_error)
             if name not in self.available:
                 raise ToolError(f"unknown tool {name!r}; available: {', '.join(self.available)}")
             _, props, required = SPECS[name]
@@ -163,11 +180,25 @@ class ToolSet:
             if unknown or missing:
                 raise ToolError(f"bad arguments for {name}: unknown={unknown} missing={missing}")
             text = getattr(self, f"_t_{name}")(**args)
-        except ToolError as e:
+            if name == "search_index":
+                self._index_used = True
+        except (ToolError, TypeError, ValueError) as e:
             error, text = str(e), f"Error: {e}"
         truncated = len(text) > self.max_output_chars
         if truncated:
             text = text[: self.max_output_chars] + f"\n...[output truncated: {len(text) - self.max_output_chars} more characters]"
+            # Record candidates actually delivered, not paths beyond the output cap.
+            visible = text.split("\n...[output truncated:", 1)[0]
+            complete_lines = visible.rsplit("\n", 1)[0] if "\n" in visible else ""
+            if name in ("ls", "list_directory"):
+                self._cur["seen"] = [p for p in self._cur["seen"]
+                                     if any(line.strip() == posixpath.basename(p)
+                                            or line.rstrip().endswith("  " + posixpath.basename(p))
+                                            or line.strip() == self._v(p)
+                                            for line in complete_lines.splitlines())]
+            else:
+                self._cur["seen"] = [p for p in self._cur["seen"]
+                                     if re.search(re.escape(self._v(p)) + r"(?=$|[\s:])", complete_lines)]
         self.tracer.log({
             "tool": name,
             "category": TOOL_CATEGORY.get(name, "other"),
@@ -205,6 +236,9 @@ class ToolSet:
             self._cur["missing"].append(p)
             raise ToolError(f"{raw}: No such file or directory (only {VROOT} is accessible)")
         os_path = self.root.joinpath(*rel.split("/")) if rel else self.root
+        if not os_path.resolve().is_relative_to(self.root.resolve()):
+            self._cur["missing"].append(p)
+            raise ToolError(f"{raw}: only /workspace is accessible")
         if must_exist:
             if not self._exists_exact(rel):
                 self._cur["missing"].append(p)
@@ -240,6 +274,8 @@ class ToolSet:
             except OSError:
                 continue
             for name in names:
+                if not (d / name).resolve().is_relative_to(self.root.resolve()):
+                    continue
                 child_rel = f"{r}/{name}" if r else name
                 is_dir = (d / name).is_dir()
                 yield child_rel, is_dir, depth + 1
@@ -273,6 +309,8 @@ class ToolSet:
         lines = []
         for name in sorted(os.listdir(os_path)):
             child = os_path / name
+            if not child.resolve().is_relative_to(self.root.resolve()):
+                continue
             child_rel = f"{rel}/{name}" if rel else name
             if child.is_dir():
                 lines.append(f"{name}/")
@@ -282,6 +320,13 @@ class ToolSet:
         return "\n".join(lines) if lines else "(empty directory)"
 
     # -- shared tools --------------------------------------------------------
+
+    def _t_stat_file(self, path: str) -> str:
+        from datetime import datetime, timezone
+        os_path, rel = self._resolve(path,kind="file")
+        self._cur["seen"].append(rel)
+        return json.dumps({"path":self._v(rel),"size_bytes":os_path.stat().st_size,
+            "modified_at":datetime.fromtimestamp(os_path.stat().st_mtime,timezone.utc).isoformat()})
 
     def _t_write_file(self, path: str, content: str) -> str:
         if not self.allow_writes:
@@ -434,10 +479,8 @@ class IndexedTools(FileTools):
     def _build_index(self) -> dict:
         docs, df = {}, Counter()
         for r in self._all_files(self.root, ""):
-            try:
-                text = self._text(r)
-            except ToolError:
-                text = ""
+            # Extraction failures are infrastructure errors, not silently empty documents.
+            text = self._text(r)
             tf = Counter(_tokens(r.replace("/", " ")) + _tokens(text))
             docs[r] = (tf, sum(tf.values()), text)
             df.update(tf.keys())
@@ -445,6 +488,8 @@ class IndexedTools(FileTools):
         return {"docs": docs, "df": df, "avg": avg, "n": len(docs)}
 
     def _t_search_index(self, query: str, k: int = 10) -> str:
+        if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+            raise ToolError("k must be a positive integer")
         if self._index is None:
             t0 = time.perf_counter()
             self._index = self._build_index()

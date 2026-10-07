@@ -68,6 +68,7 @@ def run_sweep(
                 m = generate_env(task, cfg, out_root / env_id, world_seed=seed, task_seed=seed,
                                  layout_seed=seed, env_id=env_id,
                                  sweep={"mode": mode, "vars": {k: _fmt(v) for k, v in cond.items()},
+                                        "expected_values": {k: [_fmt(v) for v in vary[k]] for k in cond},
                                         "replicate": r})
                 index.append({
                     "env_id": env_id, "task_type": task, "replicate": r, "seed": seed,
@@ -83,3 +84,26 @@ def run_sweep(
         w.writeheader()
         w.writerows(index)
     return index
+
+
+def run_profiles(task_types, profiles, out_root, *, replicates=5, seed_offset=0, overrides=()):
+    """Compare named profiles on paired worlds without adding a filesystem variable."""
+    from fsbench.config import PRESETS
+    out_root = Path(out_root)
+    if replicates < 1:
+        raise ValueError("replicates must be positive")
+    envs = []
+    for task in task_types:
+        for name in profiles:
+            cfg = PRESETS[name]
+            for key, value in overrides:
+                cfg = cfg.with_value(key, value)
+            for r in range(replicates):
+                seed = seed_offset + r
+                env = out_root / f"{task}__{name}__r{r}"
+                generate_env(task, cfg, env, world_seed=seed, task_seed=seed, layout_seed=seed,
+                    label=name, sweep={"mode": "profiles", "replicate": r})
+                envs.append(env)
+    from fsbench.difficulty import verify_composed
+    verify_composed(envs)
+    return envs

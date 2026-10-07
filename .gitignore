@@ -6,3 +6,6 @@ __pycache__/
 envs/
 runs/
 results*.csv
+datasets/
+.private/
+private_seeds*.json

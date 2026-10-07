@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Protocol
 
 from fsbench.evaluate import evaluate_run, parse_answer
+from fsbench.benchmark import load_manifest, identity
+from fsbench.experiment import fingerprint, workspace_inventory
 from fsbench.paths import long_path
 from fsbench.provenance import snapshot
 from fsbench.tools import VROOT, ToolSet, Tracer, make_toolset
@@ -45,18 +47,26 @@ def run_agent(
     toolset: str = "files",
     allow_writes: bool = True,
     max_output_chars: int = 20000,
+    run_context: dict | None = None,
+    tool_policy: str = "naturalistic",
 ) -> dict:
+    from fsbench.policies import validate_policy, usage_metrics
+    validate_policy(toolset, tool_policy)
     env, run = long_path(env_dir), long_path(run_dir)
     if run.exists():
         shutil.rmtree(run)
     run.mkdir(parents=True)
     shutil.copytree(env / "workspace", run / "workspace")
     task = json.loads((env / "task.json").read_text(encoding="utf-8"))
-    manifest = json.loads((env / "manifest.json").read_text(encoding="utf-8"))
+    manifest = load_manifest(env)
+    workspace_sha256 = fingerprint(workspace_inventory(run / "workspace"))
+    if run_context and workspace_sha256 != run_context.get("workspace_sha256"):
+        raise ValueError("trial workspace does not match the experiment plan")
 
     tracer = Tracer(run / "trace.jsonl")
     tools = make_toolset(toolset, run / "workspace", tracer,
-                         allow_writes=allow_writes, max_output_chars=max_output_chars)
+                         allow_writes=allow_writes, max_output_chars=max_output_chars, tool_policy=tool_policy,
+                         include_timestamps=manifest.get("benchmark_family")=="realistic")
     error = None
     start = time.perf_counter()
     try:
@@ -75,16 +85,27 @@ def run_agent(
     agent_describe = describe() if callable(describe) else None
     sweep = manifest.get("sweep") or {}
     (run / "meta.json").write_text(json.dumps({
+        **(run_context or {}),
         "env_dir": str(Path(env_dir).resolve()),
         "env_id": manifest.get("env_id"),
+        **identity(manifest),
         "agent": agent.name,
         "agent_describe": agent_describe,
+        "prompt_version": (agent_describe or {}).get("agent_prompt_version"),
+        "workspace_sha256": workspace_sha256,
         "model": (agent_describe or {}).get("model"),
         "task": manifest["task"]["type"],
         "toolset": toolset,
+        "tool_policy": tool_policy,
+        "evaluation_mode": "naturalistic" if tool_policy == "naturalistic" else "mechanistic",
+        "policy_version": "v1",
+        **usage_metrics(tracer.events, tool_policy),
         "allow_writes": allow_writes,
         "max_output_chars": max_output_chars,
         "world_seed": manifest["seeds"]["world"],
+        "filename_noise": manifest["config"]["filename_noise"],
+        "filename_noise_version": manifest.get("filename_noise_version", 1),
+        "condition_label": (manifest.get("condition") or {}).get("label"),
         "seeds": manifest["seeds"],
         "config": manifest["config"],
         "condition": manifest.get("condition"),
@@ -118,6 +139,9 @@ class OracleAgent:
 
     def run(self, prompt: str, tools: ToolSet) -> dict:
         m = self.manifest
+        if m.get("benchmark_family") == "realistic":
+            from fsbench.realistic_oracle import solve
+            return solve(m, tools)
         for doc_id in m["required_doc_ids"]:
             copies = [f for f in m["files"] if f["doc_id"] == doc_id]
             best = min(copies, key=lambda f: (f["path"].count("/"), f["path"]))
