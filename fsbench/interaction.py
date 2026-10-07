@@ -10,6 +10,7 @@ from itertools import combinations
 from pathlib import Path
 
 from fsbench.paths import long_path
+from fsbench.benchmark import load_manifest
 
 CONTRAST_METRICS = ("n_calls", "files_read", "total_tokens", "cost_usd", "wall_time_s", "success")
 
@@ -26,24 +27,31 @@ def _seed(r):
 
 
 def _cell(r):
-    return (float(r["filename_noise"]), r["toolset"])
+    policy = r.get("tool_policy", "naturalistic")
+    arm = r["toolset"] + ("/" + policy if policy != "naturalistic" else "")
+    return (float(r["filename_noise"]), arm)
 
 
 def factorial_pairing(rows: list[dict]) -> tuple[list[dict], list[str]]:
     """Drop whole seeds with missing/duplicate cells or different toolset inputs."""
     groups = defaultdict(list)
     passthrough = []
+    from fsbench.statistics import design_pairing
+    modern = [r for r in rows if r.get("design_version") == 2]
+    modern_kept, modern_warnings = design_pairing(modern)
     for r in rows:
+        if r.get("design_version") == 2:
+            continue
         if r.get("expected_cells"):
             groups[_group(r)].append(r)
         else:
             passthrough.append(r)
-    kept, warnings = list(passthrough), []
+    kept, warnings = list(passthrough) + modern_kept, list(modern_warnings)
     for group, rs in groups.items():
         expected = set()
         for r in rs:
             cells = json.loads(r["expected_cells"]) if isinstance(r["expected_cells"], str) else r["expected_cells"]
-            expected.update((float(c["filename_noise"]), c["toolset"]) for c in cells)
+            expected.update(_cell(c) for c in cells)
         seeds = defaultdict(list)
         for r in rs:
             seeds[_seed(r)].append(r)
@@ -88,12 +96,29 @@ def interaction_tables(rows: list[dict], *, bootstrap_seed: int = 7) -> dict[str
         raise ValueError("no complete paired trials")
     if len({_group(r) for r in rows}) != 1:
         raise ValueError("select one experiment/model/task/fixed configuration for interaction analysis")
+    failure_rows = rows
+    # Repeated calls are nested within a world; aggregate before paired contrasts.
+    repeated = defaultdict(list)
+    for r in rows:
+        repeated[(_cell(r), _seed(r))].append(r)
+    if any(len(rs)>1 for rs in repeated.values()):
+        from fsbench.evaluate import SUMMARY_METRICS
+        averaged = []
+        for rs in repeated.values():
+            if len({r.get("trial_index") for r in rs}) != len(rs):
+                raise ValueError("duplicate seed/cell/trial in interaction analysis")
+            row = dict(rs[0])
+            for metric in set(CONTRAST_METRICS) | set(SUMMARY_METRICS):
+                vs = [r.get(metric) for r in rs]
+                row[metric] = sum(vs)/len(vs) if all(v is not None for v in vs) else None
+            averaged.append(row)
+        rows = averaged
     by_cell = defaultdict(dict)
     for r in rows:
         if _seed(r) in by_cell[_cell(r)]:
             raise ValueError("duplicate seed/cell in interaction analysis")
         by_cell[_cell(r)][_seed(r)] = r
-    toolsets = sorted({r["toolset"] for r in rows})
+    toolsets = sorted({_cell(r)[1] for r in rows})
     levels = sorted({float(r["filename_noise"]) for r in rows})
     if 0.0 not in levels or 0.9 not in levels:
         raise ValueError("interaction analysis requires noise 0 and 0.9")
@@ -123,10 +148,10 @@ def interaction_tables(rows: list[dict], *, bootstrap_seed: int = 7) -> dict[str
             interactions.append({"toolset_a": a, "toolset_b": b, "metric": metric,
                                  "contrast": f"noise sensitivity {b} - {a}",
                                  **bootstrap_difference(diffs, seed=bootstrap_seed)})
-    failures = Counter((r["toolset"], r["filename_noise"], r.get("failure_type") or "success") for r in rows)
+    failures = Counter((_cell(r)[1], r["filename_noise"], r.get("task_failure_type") or r.get("failure_type") or "success") for r in failure_rows)
     sensitivity = [{"toolset": ts, **{f"delta_{r['metric']}": r["mean_difference"]
                                     for r in within if r["toolset"] == ts}} for ts in toolsets]
-    return {"summary": summarize(rows, ("toolset", "filename_noise")), "sensitivity": sensitivity, "within_toolset": within,
+    return {"summary": summarize([{**r, "toolset": _cell(r)[1]} for r in rows], ("toolset", "filename_noise")), "sensitivity": sensitivity, "within_toolset": within,
             "between_toolsets": between, "interaction": interactions,
             "failures": [{"toolset": t, "filename_noise": n, "failure_type": f, "n": count}
                          for (t, n, f), count in sorted(failures.items())]}
@@ -186,15 +211,19 @@ def write_interaction(rows: list[dict], out: str | Path, *, bootstrap_seed: int 
     return target
 
 
-def compare_trace(root, seed: int, noise: float) -> str:
+def compare_trace(root, seed: int, noise: float, *, model=None, trial_index=None) -> str:
     from fsbench.evaluate import find_runs, load_trace
 
     lines = [f"SEED {seed}  filename_noise={noise:g}"]
     found = []
     for run in find_runs(root):
         meta = json.loads((long_path(run) / "meta.json").read_text(encoding="utf-8"))
+        if model is not None and meta.get("model") != model:
+            continue
+        if trial_index is not None and meta.get("trial_index", 1) != trial_index:
+            continue
         if meta.get("world_seed") == seed and meta.get("filename_noise") == noise:
-            found.append((meta["toolset"], run, meta))
+            found.append((_cell(meta)[1], run, meta))
     if not found:
         return "\n".join(lines + ["No matching runs."])
     identities = {(m.get("model"), m.get("task"), json.dumps(m.get("seeds"), sort_keys=True),
@@ -202,7 +231,7 @@ def compare_trace(root, seed: int, noise: float) -> str:
     if len(identities) != 1 or len({t for t, _, _ in found}) != len(found):
         raise ValueError("ambiguous or mismatched traces; select a single experiment/model/task run directory")
     for ts, run, meta in sorted(found):
-        m = json.loads((long_path(meta["env_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        m = load_manifest(meta["env_dir"])
         files = {f["path"]: f for f in m["files"]}
         labels = {"required": "REQUIRED EVIDENCE", "trap": "STALE/DRAFT TRAP",
                   "near": "DISTRACTOR", "generic": "DISTRACTOR"}

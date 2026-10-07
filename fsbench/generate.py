@@ -15,9 +15,11 @@ import json
 import math
 import shutil
 from collections import Counter
+from dataclasses import asdict
 from pathlib import Path
 
 from fsbench.config import FSConfig
+from fsbench.benchmark import CAPABILITIES, SYNTHETIC_VERSION
 from fsbench.layout import FILENAME_NOISE_VERSION, Entry, place_entries, select_entries
 from fsbench.paths import long_path
 from fsbench.render import render
@@ -74,6 +76,7 @@ def generate_env(
             "clean_name": e.clean_name,
             "filename_noise_score": e.noise_score,
             "sha256": hashlib.sha256(data).hexdigest(),
+            "document_sha256": hashlib.sha256(json.dumps(asdict(e.doc), sort_keys=True).encode()).hexdigest(),
         })
 
     required_ids = [d.doc_id for d in task.required]
@@ -88,6 +91,9 @@ def generate_env(
             if extra:
                 decoys[f["doc_id"]] = extra
     manifest = {
+        "benchmark_family": "synthetic",
+        "benchmark_version": SYNTHETIC_VERSION,
+        "task_families": CAPABILITIES[task_type],
         "manifest_version": MANIFEST_VERSION,
         "filename_noise_version": FILENAME_NOISE_VERSION,
         "env_id": env_id,

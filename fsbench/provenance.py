@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import platform
+import hashlib
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,7 +36,16 @@ def snapshot() -> dict:
 
     return {
         "fsbench_version": __version__,
+        "package_version": __version__,
         "git_commit": git_commit(),
         "timestamp": utc_timestamp(),
         "python_version": platform.python_version(),
     }
+
+
+def implementation_fingerprint() -> str:
+    """Pin a plan to exact package source bytes, including uncommitted changes."""
+    digest = hashlib.sha256()
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        digest.update(path.name.encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()

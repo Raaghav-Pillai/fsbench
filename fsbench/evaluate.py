@@ -12,6 +12,7 @@ from datetime import date
 from pathlib import Path
 
 from fsbench.paths import display_path, long_path
+from fsbench.benchmark import load_manifest, identity
 from fsbench.tasks import TASK_TYPES, _money_eq, _norm, parse_date, parse_money
 
 FAILURE_TYPES = [
@@ -23,6 +24,7 @@ FAILURE_TYPES = [
     "stale_version_confusion",
     "distractor_confusion",
     "reasoning_failure",
+    "required_tool_not_used",
 ]
 
 SUMMARY_METRICS = [
@@ -31,6 +33,7 @@ SUMMARY_METRICS = [
     "score", "required_recall_read", "read_precision", "path_hallucination_rate",
     "known_path_regret", "candidate_files_seen", "steps_to_first_required_evidence",
     "input_tokens", "output_tokens", "tool_time_s",
+    "evidence_precision", "evidence_recall",
 ]
 
 
@@ -66,32 +69,62 @@ def load_trace(path: Path) -> list[dict]:
 def evaluate_run(run_dir: str | Path) -> dict:
     run = long_path(run_dir)
     meta = json.loads((run / "meta.json").read_text(encoding="utf-8"))
-    manifest = json.loads((long_path(meta["env_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+    manifest = load_manifest(meta["env_dir"])
     answer = json.loads((run / "answer.json").read_text(encoding="utf-8"))
     events = load_trace(run / "trace.jsonl")
 
     task_type = manifest["task"]["type"]
-    outcome = TASK_TYPES[task_type].score(answer, manifest["ground_truth"], run / "workspace")
+    if manifest.get("benchmark_family") == "realistic":
+        from fsbench.realistic import score_realistic
+        outcome = score_realistic(answer, manifest["ground_truth"], run / "workspace")
+    else:
+        outcome = TASK_TYPES[task_type].score(answer, manifest["ground_truth"], run / "workspace")
     io = trace_metrics(events, manifest)
     usage = meta.get("usage") or {}
     timing = _timing(events, meta, usage)
     tokens = _tokens(usage, io["tool_output_chars"])
     failure = classify_failure(outcome, io, answer, meta, manifest, run / "workspace")
+    from fsbench.policies import usage_metrics
+    policy = meta.get("tool_policy", "naturalistic")
+    tool_usage = usage_metrics(events, policy)
+    valid = tool_usage["required_tool_used"]
+    if not valid:
+        failure = {"failure_type": "required_tool_not_used", "failure_detail": "No successful required tool call before final answer"}
+    from fsbench.behavior import trajectory, failure_decomposition
+    annotations, behavior = trajectory(events, manifest, answered=not meta.get("agent_error"))
+    decomposition = failure_decomposition(failure, outcome, io, answer, meta, manifest, run / "workspace", events)
+    if (meta.get("agent_describe") or {}).get("kind")=="human" and (meta.get("agent_describe") or {}).get("interface")=="native":
+        for key in ("files_read","files_seen","read_precision","required_recall_read","required_recall_seen","candidate_files_seen","n_calls"):
+            io[key] = None
+        failure = {"failure_type":None if outcome["success"] else "unclassified_human_failure", "failure_detail":None}
+        decomposition = {"task_failure_type":failure["failure_type"],"failure_family":failure["failure_type"]}
+        for key in behavior:
+            behavior[key] = None
+    from fsbench.citations import score_citations
     return {
         "env_id": manifest["env_id"],
+        **identity(manifest),
+        **score_citations(answer, manifest),
         "task_type": task_type,
         "task_level": manifest["task"]["level"],
         "agent": meta["agent"],
         "model": meta.get("model") or (meta.get("agent_describe") or {}).get("model"),
         "toolset": meta["toolset"],
+        "tool_policy": policy,
+        "evaluation_mode": "naturalistic" if policy == "naturalistic" else "mechanistic",
+        "valid": valid,
+        **tool_usage,
         "allow_writes": meta["allow_writes"],
-        "success": bool(outcome["success"]),
+        "success": bool(outcome["success"]) and valid,
         "score": round(float(outcome["score"]), 4),
         "answer_correct": bool(outcome["success"]),
-        "evidence_found": io["required_recall_read"] == 1.0,
-        "evidence_seen": io["required_recall_seen"] == 1.0,
+        "evidence_found": io["required_recall_read"] == 1.0 if io["required_recall_read"] is not None else None,
+        "evidence_seen": io["required_recall_seen"] == 1.0 if io["required_recall_seen"] is not None else None,
         "failure_type": failure["failure_type"],
         "failure_detail": failure["failure_detail"],
+        **decomposition,
+        **behavior,
+        "trajectory": annotations,
         "outcome": outcome,
         **io,
         **timing,
@@ -105,6 +138,7 @@ def evaluate_run(run_dir: str | Path) -> dict:
         "world_seed": manifest["seeds"]["world"],
         "config_hash": (manifest.get("condition") or {}).get("config_hash"),
         "fsbench_version": meta.get("fsbench_version"),
+        "package_version": meta.get("package_version",meta.get("fsbench_version")),
         "git_commit": meta.get("git_commit"),
         "agent_prompt_version": (meta.get("agent_describe") or {}).get("agent_prompt_version"),
     }
@@ -214,8 +248,8 @@ def _tokens(usage: dict, tool_output_chars: int) -> dict:
     inp = usage.get("input_tokens")
     out = usage.get("output_tokens")
     total = usage.get("total_tokens")
-    if total is None and (inp is not None or out is not None):
-        total = (inp or 0) + (out or 0)
+    if total is None and inp is not None and out is not None:
+        total = inp + out
     return {
         "input_tokens": inp,
         "output_tokens": out,
@@ -233,18 +267,19 @@ def classify_failure(outcome: dict, io: dict, answer: dict, meta: dict, manifest
     usage = meta.get("usage") or {}
     err = meta.get("agent_error") or ""
     task_type = manifest["task"]["type"]
-    schema_keys = list(manifest["task"]["answer_schema"])
+    is_workflow = task_type == "workflow" or bool(manifest["task"].get("output_path"))
+    schema_keys = [k for k in manifest["task"]["answer_schema"] if k not in ("evidence", "sources")]
     fields = outcome.get("fields") or {}
 
     if usage.get("hit_step_limit") or "timeout" in str(err).lower():
         return {"failure_type": "timeout", "failure_detail": "step_limit" if usage.get("hit_step_limit") else "timeout"}
     if err:
         return {"failure_type": "agent_error", "failure_detail": str(err).strip().splitlines()[-1][:200]}
-    if task_type == "workflow" and fields.get("file_exists") is False:
+    if is_workflow and fields.get("file_exists") is False:
         return {"failure_type": "write_failure", "failure_detail": manifest["task"]["output_path"]}
-    if task_type == "workflow" and fields.get("header") is False:
+    if is_workflow and fields.get("header") is False:
         return {"failure_type": "output_format_failure", "failure_detail": "csv_header"}
-    if task_type != "workflow" and (not answer or any(k not in answer for k in schema_keys)):
+    if not is_workflow and (not answer or any(k not in answer for k in schema_keys)):
         return {"failure_type": "output_format_failure", "failure_detail": "missing_schema_keys"}
 
     if io["required_recall_read"] < 1.0:
@@ -324,15 +359,15 @@ def _decoy_match(task_type: str, answer: dict, io: dict, outcome: dict, manifest
 
 def find_runs(root: str | Path) -> list[Path]:
     return sorted(Path(display_path(p.parent)) for p in long_path(root).rglob("meta.json")
-                  if (p.parent / "answer.json").exists())
+                  if (p.parent / "answer.json").exists() and not (p.parent / "aborted.json").exists())
 
 
 def find_envs(root: str | Path) -> list[Path]:
     lroot = long_path(root)
-    if (lroot / "manifest.json").exists():
+    if (lroot / "manifest.json").exists() or (lroot / "evaluation_ref.json").exists():
         return [Path(display_path(lroot))]
-    return sorted(Path(display_path(p.parent)) for p in lroot.rglob("manifest.json")
-                  if (p.parent / "workspace").is_dir())
+    return sorted({Path(display_path(p.parent)) for name in ("manifest.json", "evaluation_ref.json") for p in lroot.rglob(name)
+                  if (p.parent / "workspace").is_dir()})
 
 
 def select_envs(env_dirs: list[Path], *, replicates: int | None = None, only: str | None = None) -> list[Path]:
@@ -341,7 +376,7 @@ def select_envs(env_dirs: list[Path], *, replicates: int | None = None, only: st
         return env_dirs
     out = []
     for env in env_dirs:
-        m = json.loads((long_path(env) / "manifest.json").read_text(encoding="utf-8"))
+        m = load_manifest(env)
         sweep = m.get("sweep") or {}
         if replicates is not None:
             r = sweep.get("replicate")
@@ -358,6 +393,9 @@ def select_envs(env_dirs: list[Path], *, replicates: int | None = None, only: st
 def flatten_row(metrics: dict, manifest: dict, meta: dict | None = None) -> dict:
     row = {k: v for k, v in metrics.items() if not isinstance(v, (dict, list))}
     row["fields_correct"] = json.dumps(metrics["outcome"].get("fields", {}))
+    row["task_families"] = ";".join(metrics.get("task_families", []))
+    for field in ("tool_usage_count_by_name", "tools_used", "required_tools"):
+        row[field] = json.dumps(metrics.get(field), sort_keys=True)
     for k, v in (metrics.get("usage") or {}).items():
         if not isinstance(v, list):
             row[f"usage.{k}"] = v
@@ -383,8 +421,10 @@ def flatten_row(metrics: dict, manifest: dict, meta: dict | None = None) -> dict
         row["agent_prompt_version"] = desc.get("agent_prompt_version")
         row["model"] = meta.get("model") or desc.get("model")
         for k in ("experiment", "execution_order", "experiment_order_seed", "prompt_version",
-                  "input_sha256", "workspace_sha256"):
+                  "input_sha256", "workspace_sha256", "trial_index", "condition_id", "provider",
+                  "design_version", "design_id", "implementation_sha256"):
             row[k] = meta.get(k)
+        row["study_family"] = meta.get("study_family")
         row["agent_settings"] = json.dumps(desc, sort_keys=True)
         row["expected_cells"] = json.dumps(meta["expected_cells"], sort_keys=True) if meta.get("expected_cells") else None
     return row
@@ -397,7 +437,7 @@ def evaluate_runs(root: str | Path, out_csv: str | Path | None = None, *, paired
         metrics = evaluate_run(run)
         (long_path(run) / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
         meta = json.loads((long_path(run) / "meta.json").read_text(encoding="utf-8"))
-        manifest = json.loads((long_path(meta["env_dir"]) / "manifest.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(meta["env_dir"])
         rows.append({"run_dir": str(run), **flatten_row(metrics, manifest, meta)})
     keys = list(dict.fromkeys(k for r in rows for k in r))
     for warning in balance_warnings(rows, expected_values):
@@ -465,7 +505,8 @@ def seed_sets(rows: list[dict], expected_values: dict | None = None) -> dict[tup
 def balance_warnings(rows: list[dict], expected_values: dict | None = None) -> list[str]:
     from fsbench.interaction import factorial_pairing
     warnings = factorial_pairing(rows)[1]
-    for key, by_val in seed_sets(rows, expected_values).items():
+    legacy = [r for r in rows if r.get("design_version") != 2]
+    for key, by_val in seed_sets(legacy, expected_values).items():
         sets = list(by_val.values())
         if len(sets) < 2:
             continue
@@ -482,7 +523,7 @@ def balance_warnings(rows: list[dict], expected_values: dict | None = None) -> l
 
 def mixed_version_warnings(rows: list[dict]) -> list[str]:
     warnings = []
-    for field in ("fsbench_version", "agent_prompt_version", "model", "filename_noise_version"):
+    for field in ("fsbench_version", "benchmark_version", "benchmark_family", "agent_prompt_version", "model", "filename_noise_version"):
         vals = sorted({r.get(field) for r in rows if r.get(field)})
         if len(vals) > 1:
             warnings.append(f"summary mixes {field} values: {vals}")
@@ -496,6 +537,9 @@ def keep_paired(rows: list[dict], expected_values: dict | None = None) -> list[d
                      for key, by_val in sets.items()}
     keep = []
     for r in rows:
+        if r.get("design_version") == 2 and not expected_values:
+            keep.append(r)
+            continue
         vars_ = _sweep_vars(r)
         if not vars_:
             keep.append(r)
@@ -509,7 +553,7 @@ def keep_paired(rows: list[dict], expected_values: dict | None = None) -> list[d
     return [r for r in keep if id(r) in factorial_ids]
 
 
-def summarize(rows: list[dict], by: tuple[str, ...] = ("agent", "toolset", "task_type", "condition")) -> list[dict]:
+def summarize(rows: list[dict], by: tuple[str, ...] = ("agent", "toolset", "tool_policy", "task_type", "condition")) -> list[dict]:
     groups: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:
         groups[tuple(r.get(k) for k in by)].append(r)

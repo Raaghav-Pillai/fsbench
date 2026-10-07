@@ -82,6 +82,13 @@ class FSConfig:
 
 
 PRESETS: dict[str, FSConfig] = {
+    "clean": FSConfig(depth=0, semantic_similarity=0),
+    "navigation_stress": FSConfig(depth=10, filename_noise=.8, distractors=100),
+    "ambiguity_stress": FSConfig(filename_noise=.8, distractors=100,
+                                semantic_similarity=.9, stale_version_rate=.5, duplicate_rate=.3),
+    "max_stress": FSConfig(depth=10, filename_noise=.9, dirname_noise=.8, scatter=.8,
+                          distractors=300, semantic_similarity=.9, duplicate_rate=.5,
+                          stale_version_rate=1, mime_types=ALL_FORMATS),
     "organized": FSConfig(mime_types=("txt", "csv", "pdf")),
     "moderate": FSConfig(
         depth=5,

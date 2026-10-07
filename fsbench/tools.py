@@ -63,6 +63,8 @@ def _param(type_: str, description: str, default: Any = ..., **extra) -> dict:
 
 
 SPECS: dict[str, tuple[str, dict[str, dict], list[str]]] = {
+    "stat_file": ("Show file size and filesystem modification time (copy times may not establish authority).",
+                  {"path": _param("string", "File path.")}, ["path"]),
     "ls": ("List a directory (directories end with '/').",
            {"path": _param("string", "Directory or file path.", "."),
             "long": _param("boolean", "Also show file sizes in bytes.", False)}, []),
@@ -101,6 +103,7 @@ SPECS: dict[str, tuple[str, dict[str, dict], list[str]]] = {
 }
 
 TOOL_CATEGORY = {
+    "stat_file": "navigate",
     "ls": "navigate", "cd": "navigate", "pwd": "navigate", "find": "navigate",
     "list_directory": "navigate", "glob": "navigate",
     "grep": "search", "search_files": "search", "search_index": "search",
@@ -120,7 +123,14 @@ class ToolSet:
         *,
         allow_writes: bool = True,
         max_output_chars: int = 20000,
+        tool_policy: str = "naturalistic",
+        include_timestamps: bool = False,
     ):
+        from fsbench.policies import validate_policy
+        validate_policy(self.name, tool_policy)
+        self.tool_policy = tool_policy
+        self._index_used = False
+        self.include_timestamps = include_timestamps
         self.root = long_path(root)
         if not self.root.is_dir():
             raise FileNotFoundError(root)
@@ -133,7 +143,9 @@ class ToolSet:
 
     @property
     def available(self) -> tuple[str, ...]:
-        return self.tool_names + (("write_file",) if self.allow_writes else ())
+        if self.tool_policy == "index_first" and not self._index_used:
+            return ("search_index",)
+        return self.tool_names + (("stat_file",) if self.include_timestamps else ()) + (("write_file",) if self.allow_writes else ())
 
     def specs(self, style: str = "anthropic") -> list[dict]:
         out = []
@@ -148,13 +160,18 @@ class ToolSet:
                 raise ValueError(f"unknown spec style {style!r}")
         return out
 
-    def call(self, name: str, args: dict | None = None) -> str:
+    def call(self, name: str, args: dict | None = None, *, argument_error: str | None = None) -> str:
+        if args is not None and not isinstance(args, dict):
+            argument_error = "tool arguments must be a JSON object"
+            args = {}
         args = dict(args or {})
         self._cur = {"read": [], "seen": [], "missing": [], "written": [], "path_args": [0],
                      "parse_ms": [0.0], "index_build_ms": [0.0]}
         start = time.perf_counter()
         error = None
         try:
+            if argument_error:
+                raise ToolError(argument_error)
             if name not in self.available:
                 raise ToolError(f"unknown tool {name!r}; available: {', '.join(self.available)}")
             _, props, required = SPECS[name]
@@ -163,7 +180,9 @@ class ToolSet:
             if unknown or missing:
                 raise ToolError(f"bad arguments for {name}: unknown={unknown} missing={missing}")
             text = getattr(self, f"_t_{name}")(**args)
-        except ToolError as e:
+            if name == "search_index":
+                self._index_used = True
+        except (ToolError, TypeError, ValueError) as e:
             error, text = str(e), f"Error: {e}"
         truncated = len(text) > self.max_output_chars
         if truncated:
@@ -301,6 +320,13 @@ class ToolSet:
         return "\n".join(lines) if lines else "(empty directory)"
 
     # -- shared tools --------------------------------------------------------
+
+    def _t_stat_file(self, path: str) -> str:
+        from datetime import datetime, timezone
+        os_path, rel = self._resolve(path,kind="file")
+        self._cur["seen"].append(rel)
+        return json.dumps({"path":self._v(rel),"size_bytes":os_path.stat().st_size,
+            "modified_at":datetime.fromtimestamp(os_path.stat().st_mtime,timezone.utc).isoformat()})
 
     def _t_write_file(self, path: str, content: str) -> str:
         if not self.allow_writes:

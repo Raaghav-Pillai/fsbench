@@ -1,0 +1,188 @@
+{
+  "benchmark_version": "realistic-v1",
+  "status": "candidate; human validation pending",
+  "recipe_sha256": "fc6c44b3d9b9e3aeafe8a5b06dafa0fe41218fb93dc5d578cd545afeb313d4ac",
+  "domains": [
+    "finance",
+    "legal",
+    "hr",
+    "research",
+    "engineering"
+  ],
+  "templates": [
+    {
+      "id": "finance.unpaid",
+      "capabilities": [
+        "reconciliation",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "finance.balance",
+      "capabilities": [
+        "reconciliation",
+        "multi_file_reasoning",
+        "provenance"
+      ]
+    },
+    {
+      "id": "finance.latest_invoice",
+      "capabilities": [
+        "temporal_reasoning",
+        "source_selection"
+      ]
+    },
+    {
+      "id": "finance.payment_summary",
+      "capabilities": [
+        "workflow_execution",
+        "reconciliation"
+      ]
+    },
+    {
+      "id": "finance.compliance",
+      "capabilities": [
+        "source_selection",
+        "reconciliation",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "legal.current_terms",
+      "capabilities": [
+        "source_selection",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "legal.renewal",
+      "capabilities": [
+        "retrieval",
+        "temporal_reasoning"
+      ]
+    },
+    {
+      "id": "legal.compare_terms",
+      "capabilities": [
+        "multi_file_reasoning",
+        "temporal_reasoning"
+      ]
+    },
+    {
+      "id": "legal.authority",
+      "capabilities": [
+        "source_selection"
+      ]
+    },
+    {
+      "id": "legal.terms_provenance",
+      "capabilities": [
+        "provenance",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "hr.manager",
+      "capabilities": [
+        "retrieval",
+        "source_selection"
+      ]
+    },
+    {
+      "id": "hr.payroll",
+      "capabilities": [
+        "reconciliation",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "hr.latest_review",
+      "capabilities": [
+        "temporal_reasoning",
+        "source_selection"
+      ]
+    },
+    {
+      "id": "hr.onboarding",
+      "capabilities": [
+        "workflow_execution"
+      ]
+    },
+    {
+      "id": "hr.manager_provenance",
+      "capabilities": [
+        "provenance",
+        "temporal_reasoning"
+      ]
+    },
+    {
+      "id": "research.claim_provenance",
+      "capabilities": [
+        "provenance",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "research.reconstruct",
+      "capabilities": [
+        "reconciliation",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "research.latest_analysis",
+      "capabilities": [
+        "source_selection",
+        "temporal_reasoning"
+      ]
+    },
+    {
+      "id": "research.compare_estimate",
+      "capabilities": [
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "research.coverage",
+      "capabilities": [
+        "reconciliation",
+        "source_selection"
+      ]
+    },
+    {
+      "id": "engineering.latest_result",
+      "capabilities": [
+        "source_selection",
+        "temporal_reasoning"
+      ]
+    },
+    {
+      "id": "engineering.config_provenance",
+      "capabilities": [
+        "provenance",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "engineering.compare_runs",
+      "capabilities": [
+        "multi_file_reasoning",
+        "reconciliation"
+      ]
+    },
+    {
+      "id": "engineering.regression",
+      "capabilities": [
+        "source_selection",
+        "multi_file_reasoning"
+      ]
+    },
+    {
+      "id": "engineering.summary",
+      "capabilities": [
+        "workflow_execution",
+        "provenance"
+      ]
+    }
+  ]
+}

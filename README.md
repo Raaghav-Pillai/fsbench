@@ -4,7 +4,7 @@ A benchmark for measuring how filesystem organization affects AI agents' ability
 
 Agents retrieve information, reconcile records, resolve conflicting documents, and produce output files. The benchmark tracks task success, tool calls, tokens, cost, and latency.
 
-Blog post: https://raaghav-pillai.github.io/benchmarks/fsbench/
+Read the [FSBench blog post](https://raaghav-pillai.github.io/benchmarks/fsbench/).
 
 ## Quick start
 
@@ -37,6 +37,12 @@ Use `fsbench --help` for commands, including `sweep` for controlled experiments 
 For controlled filename experiments, see the [filename noise guide](docs/filename-noise.md), including the paired 80-run recipe and diagnostic definitions.
 
 To compare retrieval interfaces on those same environments, see the [toolset interaction experiment](docs/toolset-interaction.md).
+
+Version 0.2 adds enforced tool policies, named stress profiles, multi-model runs, repeated trials with world-paired statistics, and automatic trajectory analysis. See the [v0.2 guide](docs/v0.2.md) for reproducible commands and metric definitions.
+
+The [240-run controlled index-use study](docs/tool-policy-results.md) found that index-first retrieval reduced overall effort, while filename-noise sensitivity remained.
+
+Version 0.3 adds a **Realistic candidate pack** alongside the synthetic benchmark: five workplace domains, 25 task templates, citation scoring, private held-out seeds, content-based oracle validation, and human-baseline collection. The local 100-world pack passes all 500 automated task checks; human validation is still pending. See the [benchmark card](BENCHMARK_CARD.md), [v0.3 guide](docs/v0.3.md), and [human study protocol](docs/human-protocol.md).
 
 ## Help out
 
